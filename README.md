@@ -73,7 +73,7 @@ real local model. Expect rough edges, and please open an issue when you hit one.
 
    ```bash
    cd path/to/your/repo
-   dsh-runner check     # config, cards, dependencies, dsh and hermes on PATH, headless default model
+   dsh-runner check     # config, cards, dependencies, hermes on PATH, launches dsh, headless default model
    dsh-runner sync      # create one board task per card, with dependency links
    ```
 
@@ -165,12 +165,15 @@ PAUSE does the same to a runner that is mid-session, which then exits. A runner 
 the file is removed.
 
 If the model server is unreachable (DSH exits with an error and no output), the runner retries with backoff
-without counting an attempt. If it is still down, it releases the card and exits with status 3.
+without counting an attempt. If it is still down, it releases the card and exits with status 3. A `dsh` that
+cannot start at all (exit 126 or 127, such as `env: node: No such file or directory`) is a setup problem, not an
+outage: the runner stops at once with the error instead of retrying. Run `dsh-runner check` from the same
+environment the runner uses (service manager, cron, `nohup`) to catch this before a long run.
 
 | Exit status | Meaning |
 |---|---|
 | 0 | No ready cards remain, only gates remain, `--once`/`--card` finished, or STOP/PAUSE stopped the runner |
-| 1 | Refused to start: wrong branch, uncommitted changes, or a configuration error (the message says which) |
+| 1 | Refused to run: wrong branch, uncommitted changes, a configuration error, or `dsh` cannot be launched at all (for example its `node` is not on `PATH`); the message says which, and the card is released |
 | 3 | The model server was unreachable; the card was released, not blocked |
 
 ## Configuration

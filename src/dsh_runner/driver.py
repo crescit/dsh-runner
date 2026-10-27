@@ -58,6 +58,18 @@ class Unreachable(Exception):
     """DSH produced no output after every infrastructure retry."""
 
 
+class BrokenSetup(Exception):
+    """DSH could not be launched at all (exit 126/127): a local setup problem, never worth retrying."""
+
+
+def launch_failure(stats: dict, logdir: Path, tag: str = "") -> str | None:
+    """The stderr line explaining a failed launch (missing interpreter, not executable), or None."""
+    if stats["exit"] not in (126, 127) or stats["tool_calls"] or stats["output_tokens"]:
+        return None
+    stderr = (logdir / f"stderr{tag}.txt").read_text(errors="replace").strip().splitlines()
+    return stderr[0] if stderr else f"exit {stats['exit']}"
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -272,6 +284,8 @@ class Driver:
         """Retry with backoff when DSH fails without output; such runs do not consume a card attempt."""
         for k in range(1, self.config.infra_retries + 1):
             stats = self.run_dsh(prompt, logdir, session_id=session_id)
+            if (reason := launch_failure(stats, logdir)) is not None:
+                raise BrokenSetup(f"could not launch {self.config.dsh_command()}: {reason}")
             if not self.infra_failure(stats):
                 return stats
             logdir.rename(logdir.with_name(f"{logdir.name}-infra{k}-{datetime.now():%H%M%S%f}"))
@@ -417,7 +431,12 @@ class Driver:
                 stats = dict(exit=0, minutes=0.0, seconds=0.0, tool_calls=0, output_tokens=0, final="",
                              session=None, carried=True)
             else:
-                stats = self.run_dsh_retrying(prompt, logdir, tid, continuation)
+                try:
+                    stats = self.run_dsh_retrying(prompt, logdir, tid, continuation)
+                except BrokenSetup as exc:
+                    self.board.comment(tid, f"runner: not started, DSH setup is broken: {exc}")
+                    self.board.reclaim(tid, "DSH setup broken")
+                    raise
             if self.infra_failure(stats):
                 # The model never answered, so this says nothing about the card: release it and stop the runner,
                 # since every other card would hit the same outage.
@@ -574,6 +593,9 @@ class Driver:
             except Unreachable as exc:
                 log(str(exc))
                 return 3
+            except BrokenSetup as exc:
+                log(f"{card.id}: {exc}; fix the setup (dsh-runner check) and rerun")
+                return 1
             if not ok:
                 log(f"{card.id} not completed; continuing with other ready cards")
             if once or only:

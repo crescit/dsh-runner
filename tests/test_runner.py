@@ -169,6 +169,23 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.board()["A01"]["status"], "ready")
         self.assertEqual(self.git("log", "-1", "--format=%s"), "cards")
 
+    def test_a_dsh_that_cannot_launch_fails_fast_without_retries(self):
+        # Found in a real run: node missing from PATH looked like an outage and was retried with backoff.
+        self.commit_cards(A01=card("A01", "Write ok"))
+        self.plan({"write": {"src/out.txt": "ok"}})
+        with patch.dict(os.environ, FAKE_DSH_BROKEN="1"):
+            self.assertEqual(self.run_driver(), 1)
+        self.assertEqual(self.board()["A01"]["status"], "ready")
+        self.assertTrue(any("node: No such file" in c for c in self.board()["A01"]["comments"]))
+        self.assertEqual(len(list((self.repo / "runs/board/A01").glob("attempt-*"))), 1)
+
+    def test_check_launches_dsh(self):
+        from dsh_runner import cli
+        self.commit_cards(A01=card("A01", "Write ok"))
+        self.assertEqual(cli.main(["-C", str(self.repo), "check"]), 0)
+        with patch.dict(os.environ, FAKE_DSH_BROKEN="1"):
+            self.assertEqual(cli.main(["-C", str(self.repo), "check"]), 1)
+
     def test_stop_file_prevents_any_session(self):
         self.commit_cards(A01=card("A01", "Write ok"))
         (self.repo / "runs" / "board").mkdir(parents=True)

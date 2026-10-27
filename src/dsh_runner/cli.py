@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 from . import __version__
@@ -51,6 +52,18 @@ def check(driver: Driver) -> int:
     print(f"dsh      {dsh} (DSH_HOME {config.dsh_home})")
     if not shutil.which(dsh) and not Path(dsh).is_file():
         problems.append("dsh not found: install the DeepSeek Harness CLI or set [dsh] bin")
+    else:
+        # Launch it the way the runner will: a present file can still fail (e.g. node missing from PATH).
+        try:
+            launched = subprocess.run([dsh, "--version"], capture_output=True, text=True, timeout=60,
+                                      env=driver.dsh_env())
+            if launched.returncode:
+                reason = (launched.stderr.strip().splitlines() or [f"exit {launched.returncode}"])[0]
+                problems.append(f"dsh does not launch: {reason}")
+            else:
+                print(f"dsh      version {launched.stdout.strip()}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            problems.append(f"dsh does not launch: {exc}")
     if not shutil.which(driver.board.hermes):
         problems.append("hermes not found: install Hermes Agent or set DSH_RUNNER_HERMES")
     print(f"model    {driver.dsh_setting('model')} (headless profile default)")
