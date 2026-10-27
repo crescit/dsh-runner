@@ -1,6 +1,6 @@
 # dsh-runner
 
-Run a backlog of small coding cards overnight with a local model, and wake up to commits you can trust.
+Work through a backlog of small coding cards with a local model, keeping only the commits you can trust.
 
 `dsh-runner` takes cards from a [Hermes Agent](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)
 kanban board. It hands each one to a model through the headless mode of the
@@ -10,7 +10,7 @@ before committing anything. The model never commits. The runner:
 - reverts any file the card did not allow,
 - re-runs the card's acceptance command itself instead of trusting the model's report,
 - commits only work that passes, with a subject that marks the card done,
-- carries unfinished work into the next attempt, or the next night, instead of starting over.
+- carries unfinished work into the next attempt or run instead of starting over.
 
 Smaller and mid-sized local models finish far more work with a strict harness like this than they do as a
 free-roaming agent. A card says exactly which files may change and how "done" is measured. The runner enforces
@@ -117,7 +117,7 @@ What makes cards work well with weaker models:
 - **Make the acceptance command fast and deterministic.** It runs after every attempt, and again whenever the
   runner needs to check carried work.
 - **Split big cards** into a chain with `depends`, and gate the parts a human should look at first.
-- **Review in the morning.** Passing tests prove what the tests check, nothing more. Read the diffs, especially
+- **Review the commits.** Passing tests prove what the tests check, nothing more. Read the diffs, especially
   anything security-related.
 
 See [`examples/cards/A01-example.md`](examples/cards/A01-example.md).
@@ -130,7 +130,7 @@ See [`examples/cards/A01-example.md`](examples/cards/A01-example.md).
 - **Terminal:** `hermes kanban --board my-project watch`, or `hermes kanban --board my-project show <task>` for
   one card's comments and events.
 - **DSH web UI:** `dsh web` shows the harness and its sessions, which is useful for checking the profile and
-  model before an overnight run.
+  model before a long run.
 - **Files:** each attempt writes `runs/board/<id>/attempt-N/`, containing the exact prompt, the session's NDJSON
   events, stderr, the acceptance log and `result.json` (minutes, tool calls, output tokens, files touched,
   reverted files, PASS/FAIL).
@@ -180,7 +180,7 @@ accept_timeout_min = 15
 attempts = 2
 infra_retries = 4
 infra_backoff_s = 60            # doubled on each retry
-cooldown_s = 120                # idle gap between model sessions (lets a busy GPU box cool down)
+cooldown_s = 120                # idle gap between model sessions (spares a shared model server)
 min_nudge_s = 180               # a session that only read gets nudged to write, if this much time remains
 pause_file = "~/.dsh-runner/PAUSE"
 model_lock = "~/.dsh-runner/model.lock"

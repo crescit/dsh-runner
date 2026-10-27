@@ -83,7 +83,7 @@ class Driver:
         snap = {}
         for name in self.git("ls-files", "-co", "--exclude-standard").splitlines():
             path = self.c.repo / name
-            if path.is_file() and not name.startswith(self.c.always_ignored):
+            if path.is_file() and not name.startswith(self.c.always_ignored) and not is_bytecode(name):
                 snap[name] = hashlib.sha256(path.read_bytes()).hexdigest()
         return snap
 
@@ -101,7 +101,8 @@ class Driver:
 
     def dirty(self) -> list[str]:
         lines = self.git("status", "--porcelain").splitlines()
-        return [line for line in lines if line[3:] and not line[3:].startswith(self.c.always_ignored)]
+        return [line for line in lines
+                if line[3:] and not line[3:].startswith(self.c.always_ignored) and not is_bytecode(line[3:])]
 
     # --- board ------------------------------------------------------------------------------------------------
 
@@ -570,6 +571,11 @@ class Driver:
                 log(f"{card.id} not completed; continuing with other ready cards")
             if once or only:
                 return 0
+
+
+def is_bytecode(name: str) -> bool:
+    """Python caches written by test runs are never worker edits, ignored by git or not."""
+    return "__pycache__" in Path(name).parts or name.endswith((".pyc", ".pyo"))
 
 
 def kill_group(process: subprocess.Popen) -> None:

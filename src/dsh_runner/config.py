@@ -66,6 +66,7 @@ class Config:
         """Environment for DSH and acceptance runs: DSH_HOME plus config env, with ./paths resolved in the repo."""
         env = os.environ.copy()
         env["DSH_HOME"] = str(self.dsh_home)
+        env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
         for key, value in self.env.items():
             env[key] = str(self.repo / value) if value.startswith("./") else value
         return env

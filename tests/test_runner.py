@@ -108,6 +108,14 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("Edit ONLY these files: src/out.txt", self.prompt(0))
         self.assertIn("- Keep changes small.", self.prompt(0))
 
+    def test_python_bytecode_is_not_an_out_of_scope_edit(self):
+        # Found by a real smoke run: a model running the tests left src/__pycache__/*.pyc behind.
+        self.commit_cards(A01=card("A01", "Write ok"))
+        self.plan({"write": {"src/out.txt": "ok", "src/__pycache__/out.cpython-312.pyc": "bytecode"}})
+        self.assertEqual(self.run_driver(), 0)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "A01: Write ok")
+        self.assertEqual(self.git("show", "--name-only", "--format=", "HEAD"), "src/out.txt")
+
     def test_out_of_scope_edits_are_reverted_and_never_committed(self):
         self.commit_cards(A01=card("A01", "Write ok"))
         self.plan({"write": {"src/out.txt": "ok", "README.md": "tampered\n", "src/extra.txt": "x"}},
