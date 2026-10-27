@@ -16,6 +16,10 @@ Smaller and mid-sized local models finish far more work with a strict harness li
 free-roaming agent. A card says exactly which files may change and how "done" is measured. The runner enforces
 both.
 
+**Status:** early (0.1). The loop comes from a private runner that has closed well over a hundred cards. This
+packaged version is covered by end-to-end tests against fake `hermes` and `dsh`, and has been smoke-tested with a
+real local model. Expect rough edges, and please open an issue when you hit one.
+
 ```
  card files (docs/cards/*.md)          Hermes kanban board                dsh headless
  ───────────────────────────  sync →  ─────────────────────  pick →  ┌──────────────────┐
@@ -108,6 +112,15 @@ Implement `load_settings(path)` in src/app/settings.py. ...
 | `accept` | A shell command, run from the repository root by the runner. Exit status 0 means done. |
 | `gate` | `true` holds the card for a human. Other ready cards keep running. |
 
+A card whose `accept` command names a repository file (such as `tests/test_x.py`) that neither exists nor appears
+in `allowed` is **held**: it is blocked with a comment saying what is missing, and the runner moves on.
+
+Python bytecode (`__pycache__/`, `*.pyc`) never counts as an edit, and worker and acceptance runs set
+`PYTHONDONTWRITEBYTECODE=1`, so running the tests does not trip the scope check.
+
+Each commit's message records what produced it: the model and reasoning effort, the attempt number, minutes, tool
+calls, output tokens, the acceptance command and its last output line.
+
 What makes cards work well with weaker models:
 
 - **Write the acceptance tests first, and keep them out of `allowed`.** A test file the model cannot edit is
@@ -139,22 +152,31 @@ See [`examples/cards/A01-example.md`](examples/cards/A01-example.md).
 
 | Action | How |
 |---|---|
-| Stop after the current check | `touch runs/board/STOP` (remove it to allow runs again) |
-| Pause every runner on the machine | `touch ~/.dsh-runner/PAUSE` (configurable `pause_file`) |
+| Stop this runner now | `touch runs/board/STOP` (remove it to allow runs again) |
+| Pause every runner on the machine | `touch ~/.dsh-runner/PAUSE` (configurable `pause_file`; remove it to resume) |
 | Lengthen the gap between sessions | `echo 300 > runs/board/COOLDOWN_S` (seconds, minimum 60; read live) |
 | Share one model server between repos | Point their `model_lock` at the same file, and the runners take turns |
 
-When stopped or paused mid-card, the runner kills the session, saves the card's partial edits under
-`runs/board/<id>/carry/`, reverts them, and releases the task. Your next run restores those edits and tells the
-model what earlier attempts found.
+STOP takes effect immediately: a running session is killed, the card's partial edits are saved under
+`runs/board/<id>/carry/` and reverted, the task is released, and the runner exits. The attempt is not counted, and
+the next run restores those edits and tells the model what earlier attempts found.
+
+PAUSE does the same to a runner that is mid-session, which then exits. A runner that is between cards waits until
+the file is removed.
 
 If the model server is unreachable (DSH exits with an error and no output), the runner retries with backoff
-without counting an attempt. If it is still down, it releases the card and exits with status 3, so a service
-manager or wrapper can tell an outage from a finished queue.
+without counting an attempt. If it is still down, it releases the card and exits with status 3.
+
+| Exit status | Meaning |
+|---|---|
+| 0 | No ready cards remain, only gates remain, `--once`/`--card` finished, or STOP/PAUSE stopped the runner |
+| 1 | Refused to start: wrong branch, uncommitted changes, or a configuration error (the message says which) |
+| 3 | The model server was unreachable; the card was released, not blocked |
 
 ## Configuration
 
-All keys except `board` are optional:
+All keys except `board` are optional. Unknown sections or keys are an error, so a typo cannot silently fall
+back to a default.
 
 ```toml
 [runner]
