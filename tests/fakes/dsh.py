@@ -3,6 +3,7 @@
 Each plan step is a dict:
     {"write": {"relative/path": "content"}}   files to write in the repository (cwd)
     {"silent_fail": true}                     exit 1 with no output, like an unreachable model server
+    {"truncate": true}                        read a file, then end the turn at the output-token limit (exit 1)
 Invocations beyond the plan behave like a session that only reads.
 """
 import json
@@ -34,4 +35,9 @@ for name, content in step.get("write", {}).items():
     path.write_text(content)
     emit({"type": "tool_call", "tool": "write", "input": {"file_path": name}})
 emit({"type": "status", "phase": "step_end", "usage": {"outputTokens": 42}})
+if step.get("truncate"):
+    emit({"type": "tool_call", "tool": "read", "input": {"file_path": "README.md"}})
+    emit({"type": "status", "phase": "turn_end", "reason": {"kind": "max-tokens"}})
+    emit({"type": "final", "text": "I need to create the file. Let me read more first."})
+    sys.exit(1)
 emit({"type": "final", "text": f"fake session {index} done"})

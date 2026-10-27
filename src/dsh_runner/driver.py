@@ -45,6 +45,9 @@ HEADER = """RUNNER NOTE (read first)
 """
 NUDGE = ("Continue the unfinished implementation from the current files and session context. Write or fix code in "
          "{allowed} with the file tools in this turn, then run `{accept}` and fix failures until it passes.")
+TRUNCATED_NUDGE = ("Your last turn hit the output-token limit before the work was written. Do not read more files: you "
+                   "already have the context. Keep reasoning short, write {allowed} now with the file tools, then run "
+                   "`{accept}` and fix failures until it passes.")
 
 
 class Stopped(Exception):
@@ -254,6 +257,8 @@ class Driver:
             output_tokens=sum(e.get("usage", {}).get("outputTokens", 0) for e in events if e.get("phase") == "step_end"),
             final=next((e.get("text", "") for e in reversed(events) if e.get("type") == "final"), ""),
             session=next((e.get("sessionId") for e in events if e.get("type") == "session"), session_id),
+            truncated=any(e.get("phase") == "turn_end" and (e.get("reason") or {}).get("kind") == "max-tokens"
+                          for e in events),
         )
         (logdir / f"supervision{tag}.json").write_text(json.dumps(stats, indent=2))
         return stats
@@ -422,8 +427,10 @@ class Driver:
                 self.board.reclaim(tid, "DSH unreachable")
                 raise Unreachable(f"{card.id}: DSH unreachable; see {logdir}/stderr.txt")
             nudge = 0
-            while stats["exit"] == 0 and not any(f in allowed for f in self.changed(before, self.snapshot())):
-                # A turn that ended after only reading gets nudged to write, within the attempt's time budget.
+            while (stats["exit"] == 0 or stats.get("truncated")) \
+                    and not any(f in allowed for f in self.changed(before, self.snapshot())):
+                # A turn that ended after only reading, or that hit the output-token limit, is resumed with a nudge
+                # to write, within the attempt's time budget.
                 if any(f in allowed for f in self.changed(card_start, self.snapshot())) \
                         and self.acceptance(accept, logdir)[0]:
                     break
@@ -431,7 +438,8 @@ class Driver:
                 if left < self.config.min_nudge_s:
                     break
                 nudge += 1
-                more = self.run_dsh(NUDGE.format(allowed=", ".join(allowed), accept=accept) + "\n" +
+                text = TRUNCATED_NUDGE if stats.get("truncated") else NUDGE
+                more = self.run_dsh(text.format(allowed=", ".join(allowed), accept=accept) + "\n" +
                                     self.evidence(logdir, allowed), logdir, session_id=stats.get("session"),
                                     tag=f"-nudge{nudge}", budget=left)
                 stats = {**more, "minutes": round(stats["minutes"] + more["minutes"], 1),

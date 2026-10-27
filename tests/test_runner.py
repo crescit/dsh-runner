@@ -119,6 +119,19 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.git("log", "-1", "--format=%s"), "A01: Write ok")
         self.assertEqual(self.git("show", "--name-only", "--format=", "HEAD"), "src/out.txt")
 
+    def test_session_cut_off_at_the_token_limit_is_resumed_not_failed(self):
+        # Found in a real run: a model read for a whole turn, hit max-tokens before writing, and lost the attempt.
+        self.commit_cards(A01=card("A01", "Write ok"))
+        config = self.repo / "dsh-runner.toml"
+        config.write_text(config.read_text().replace("min_nudge_s = 3600", "min_nudge_s = 1"))
+        self.git("commit", "-qam", "nudge sooner")
+        self.plan({"truncate": True}, {"write": {"src/out.txt": "ok"}})
+        self.assertEqual(self.run_driver(), 0)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "A01: Write ok")
+        self.assertIn("output-token limit", self.prompt(1))
+        result = json.loads((self.repo / "runs/board/A01/attempt-1/result.json").read_text())
+        self.assertEqual((result["attempt"], result["nudges"]), (1, 1))
+
     def test_out_of_scope_edits_are_reverted_and_never_committed(self):
         self.commit_cards(A01=card("A01", "Write ok"))
         self.plan({"write": {"src/out.txt": "ok", "README.md": "tampered\n", "src/extra.txt": "x"}},
