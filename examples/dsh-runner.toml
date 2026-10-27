@@ -1,0 +1,21 @@
+# dsh-runner configuration: copy to the root of the repository your cards change.
+# Only [runner] board is required; everything else shows its default or a common choice.
+
+[runner]
+board = "my-project"
+branch = "main"
+assignee = "dsh-runner"        # keep this NOT a Hermes profile name, so the Hermes dispatcher ignores runner cards
+cards_dir = "docs/cards"
+log_dir = "runs/board"         # add to .gitignore
+# setup = ["uv", "sync", "--frozen", "-q"]
+# ignored = [".venv/", ".pytest_cache/"]
+# worker_rules = ["Run Python only through `uv run --frozen ...`."]
+# env = { UV_CACHE_DIR = "./.uvcache" }
+
+[dsh]
+# home = "~/.dsh"
+
+[limits]
+run_timeout_min = 30
+attempts = 2
+cooldown_s = 120
