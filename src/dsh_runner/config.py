@@ -72,6 +72,17 @@ class Config:
         return env
 
 
+# Which dataclass fields each TOML section may set; anything else is a typo and an error.
+SECTIONS = {
+    "runner": ("board", "branch", "planner_branch", "assignee", "cards_dir", "card_pattern", "log_dir",
+               "setup", "ignored", "worker_rules", "env"),
+    "dsh": ("home", "bin"),
+    "limits": ("run_timeout_min", "accept_timeout_min", "min_nudge_s", "attempts", "infra_retries",
+               "infra_backoff_s", "cooldown_s", "poll_s", "pause_file", "model_lock"),
+}
+PATHS = {"pause_file", "model_lock"}
+
+
 def _path(value: str) -> Path:
     return Path(os.path.expandvars(value)).expanduser()
 
@@ -81,22 +92,18 @@ def load(repo: Path, path: Path | None = None) -> Config:
     if not path.is_file():
         raise SystemExit(f"no {CONFIG_NAME} at {path}; copy examples/{CONFIG_NAME} and edit it")
     data = tomllib.loads(path.read_text())
+    unknown = [f"[{name}]" for name in data if name not in SECTIONS]
+    unknown += [f"{name}.{key}" for name, keys in SECTIONS.items() for key in data.get(name, {}) if key not in keys]
+    if unknown:
+        raise SystemExit(f"{path}: unknown setting(s): {', '.join(unknown)}")
     runner, dsh, limits = data.get("runner", {}), data.get("dsh", {}), data.get("limits", {})
     if not runner.get("board"):
         raise SystemExit(f"{path}: [runner] board is required")
-    config = Config(repo=repo.resolve(), board=runner["board"])
-    for key in ("branch", "planner_branch", "assignee", "cards_dir", "card_pattern", "log_dir",
-                "setup", "ignored", "worker_rules", "env"):
-        if key in runner:
-            setattr(config, key, runner[key])
-    if "home" in dsh or os.environ.get("DSH_HOME"):
-        config.dsh_home = _path(dsh.get("home") or os.environ["DSH_HOME"])
+    config = Config(repo=repo.resolve(), **runner)
+    for key, value in limits.items():
+        setattr(config, key, _path(value) if key in PATHS else value)
+    home = dsh.get("home") or os.environ.get("DSH_HOME")
+    if home:
+        config.dsh_home = _path(home)
     config.dsh_bin = dsh.get("bin", "")
-    for key in ("run_timeout_min", "accept_timeout_min", "min_nudge_s", "attempts", "infra_retries",
-                "infra_backoff_s", "cooldown_s", "poll_s"):
-        if key in limits:
-            setattr(config, key, limits[key])
-    for key in ("pause_file", "model_lock"):
-        if key in limits:
-            setattr(config, key, _path(limits[key]))
     return config

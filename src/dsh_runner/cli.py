@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def check(driver: Driver) -> int:
-    config, problems = driver.c, []
+    config, problems = driver.config, []
     cards = load_cards(config.cards_path, config.card_pattern)
     print(f"repo     {config.repo} (branch {config.branch})")
     print(f"board    {config.board}, assignee {config.assignee}")

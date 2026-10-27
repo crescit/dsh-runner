@@ -2,11 +2,13 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -43,10 +45,11 @@ class RunnerTest(unittest.TestCase):
             wrapper = bin_dir / name
             wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {FAKES / (name + '.py')} \"$@\"\n")
             wrapper.chmod(0o755)
-        os.environ.update(FAKE_HERMES_DB=str(self.tmp / "board.json"), FAKE_DSH_PLAN=str(self.tmp / "plan.json"),
-                          DSH_RUNNER_HERMES=str(bin_dir / "hermes"))
-        self.addCleanup(lambda: [os.environ.pop(k, None) for k in ("FAKE_HERMES_DB", "FAKE_DSH_PLAN",
-                                                                    "DSH_RUNNER_HERMES")])
+        env = patch.dict(os.environ, FAKE_HERMES_DB=str(self.tmp / "board.json"),
+                         FAKE_DSH_PLAN=str(self.tmp / "plan.json"), DSH_RUNNER_HERMES=str(bin_dir / "hermes"))
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
         (self.repo / "docs" / "cards").mkdir(parents=True)
         (self.repo / "tools").mkdir()
         (self.repo / "tools" / "check.py").write_text(CHECK)
@@ -170,12 +173,19 @@ class RunnerTest(unittest.TestCase):
     def test_sync_is_idempotent(self):
         self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", depends=["A01"]))
         driver = Driver(load(self.repo))
-        cards = load_cards(driver.c.cards_path, driver.c.card_pattern)
+        cards = load_cards(driver.config.cards_path, driver.config.card_pattern)
         driver.sync_board(cards)
         driver.sync_board(cards)
         board = self.board()
         self.assertEqual(sorted(board), ["A01", "A02"])
         self.assertEqual(board["A02"]["parents"], [board["A01"]["id"]])
+
+    def test_unknown_config_keys_are_errors(self):
+        self.commit_cards(A01=card("A01", "Write ok"))
+        config = self.repo / "dsh-runner.toml"
+        config.write_text(config.read_text().replace("run_timeout_min", "run_timout_min"))
+        with self.assertRaisesRegex(SystemExit, "limits.run_timout_min"):
+            load(self.repo)
 
     def test_card_header_is_validated(self):
         path = self.tmp / "bad.md"

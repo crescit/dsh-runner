@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsh-runner"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Run Hermes kanban cards through the DeepSeek Harness, committing only verified work"
 readme = "README.md"
 license = { text = "MIT" }
@@ -22,6 +22,9 @@ Repository = "https://github.com/crescit/dsh-runner"
 
 [project.scripts]
 dsh-runner = "dsh_runner.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "dsh_runner.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

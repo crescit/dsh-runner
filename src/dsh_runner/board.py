@@ -41,3 +41,31 @@ class Board:
                        "--workspace", f"dir:{workdir}", "--idempotency-key", f"{self.slug}-{card.id}", "--json")
         if out.returncode:
             print(f"warn: could not create board card {card.id}: {out.stderr.strip()}", flush=True)
+
+    def edit(self, task_id: str, title: str, body: str) -> None:
+        self.run("edit", task_id, "--title", title, "--body", body)
+
+    def link(self, parent: str, child: str) -> None:
+        self.run("link", parent, child)
+
+    def unlink(self, parent: str, child: str) -> None:
+        self.run("unlink", parent, child)
+
+    def promote(self, task_id: str) -> None:
+        self.run("promote", task_id)
+
+    def claim(self, task_id: str, ttl_s: int) -> None:
+        self.run("claim", task_id, "--ttl", str(ttl_s))
+
+    def comment(self, task_id: str, text: str) -> None:
+        self.run("comment", task_id, text)
+
+    def complete(self, task_id: str, result: str, summary: str) -> None:
+        self.run("complete", task_id, "--result", result, "--summary", summary)
+
+    def block(self, task_id: str, reason: str) -> None:
+        self.run("block", task_id, reason)
+
+    def reclaim(self, task_id: str, reason: str) -> None:
+        self.run("reclaim", task_id, "--reason", reason)
+
