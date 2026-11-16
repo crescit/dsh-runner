@@ -9,7 +9,8 @@ before committing anything. The model never commits. The runner:
 
 - reverts any file the card did not allow,
 - re-runs the card's acceptance command itself instead of trusting the model's report,
-- commits only work that passes, with a subject that marks the card done,
+- commits only work that passes, with a subject that marks the card done; if the acceptance command already passes
+  on a clean checkout, it records a verified no-change completion without starting a model session,
 - carries unfinished work into the next attempt or run instead of starting over.
 
 Smaller and mid-sized local models finish far more work with a strict harness like this than they do as a
@@ -110,7 +111,8 @@ Implement `load_settings(path)` in src/app/settings.py. ...
 | `id` | Letters then digits, with an optional letter suffix (`A02`, `O13b`). Board titles and commit subjects are `<id>: <title>`. |
 | `depends` | Card ids that must be done first. A card counts as done when its task is done or a commit with its exact subject is on the branch. |
 | `allowed` | The only files the model may change. Everything else is reverted before acceptance runs. |
-| `accept` | A shell command, run from the repository root by the runner. Exit status 0 means done. |
+| `accept` | A shell command, run from the repository root by the runner. Exit status 0 means done, including when the
+  card needs no edits and the clean checkout already passes. |
 | `gate` | `true` holds the card for a human. Other ready cards keep running. |
 
 A card whose `accept` command names a repository file (such as `tests/test_x.py`) that neither exists nor appears

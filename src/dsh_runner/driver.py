@@ -478,6 +478,27 @@ class Driver:
                                        f"(DSH {model}, effort {effort})")
         retry, continuation = "", None
         card_start = self.snapshot()
+        # A card can already be complete when earlier work or a prior card satisfied its
+        # acceptance contract. Verify that before starting a model session: asking the
+        # model to make an unnecessary edit causes needless nudges and cooldowns.
+        preflight_dir = self.config.log_path / card.id / "preflight"
+        preflight_dir.mkdir(parents=True, exist_ok=True)
+        already_ok, preflight_tail = self.acceptance(accept, preflight_dir)
+        preflight_changes = self.changed(card_start, self.snapshot())
+        if already_ok and not preflight_changes:
+            summary = {"acceptance": "PASS", "touched": [], "verification": "no-change"}
+            (preflight_dir / "result.json").write_text(json.dumps({
+                "attempt": 0, "model": model, "effort": effort, "minutes": 0.0,
+                "tool_calls": 0, "output_tokens": 0, "acceptance": "PASS", "touched": [],
+                "verification": "no-change", "accept_tail": preflight_tail, "at": now(),
+            }, indent=2))
+            self.board.complete(tid, "verified no-change", f"{card.id} already satisfies acceptance; " +
+                                json.dumps(summary))
+            return True
+        if preflight_changes:
+            # Acceptance commands may generate files. They cannot count as evidence that
+            # the card was already complete, so restore the checkout before the model run.
+            self.revert(preflight_changes)
         prior = self.restore_carry(card)
         for attempt in range(1, self.config.attempts + 1):
             logdir = self.config.log_path / card.id / f"attempt-{attempt}"
