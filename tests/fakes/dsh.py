@@ -3,6 +3,7 @@
 Each plan step is a dict:
     {"write": {"relative/path": "content"}}   files to write in the repository (cwd)
     {"silent_fail": true}                     exit 1 with no output, like an unreachable model server
+    {"write_allowed": "content"}              write content to every file the prompt allows (order-free plans)
     {"truncate": true}                        read a file, then end the turn at the output-token limit (exit 1)
 Invocations beyond the plan behave like a session that only reads. `--version` prints a version, and with
 $FAKE_DSH_BROKEN set every launch fails like a missing interpreter (exit 127).
@@ -38,6 +39,9 @@ def emit(event):
 
 
 emit({"type": "session", "sessionId": f"session-{index}"})
+if "write_allowed" in step:
+    allowed = prompt.split("Edit ONLY these files: ", 1)[1].split(". Any other", 1)[0].split(", ")
+    step["write"] = {name: step["write_allowed"] for name in allowed}
 for name, content in step.get("write", {}).items():
     path = Path(name)
     path.parent.mkdir(parents=True, exist_ok=True)

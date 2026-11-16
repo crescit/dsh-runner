@@ -1,5 +1,6 @@
 """Fake `hermes kanban` CLI backed by a JSON file ($FAKE_HERMES_DB), covering the commands dsh-runner uses."""
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,8 @@ def main(argv):
     parser.add_argument("command")
     parser.add_argument("rest", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv[1:])
+    lock = open(str(DB) + ".lock", "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)  # several workers may call at once
     db = load()
     tasks = db["tasks"]
     rest = args.rest

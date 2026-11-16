@@ -25,6 +25,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from .board import Board
@@ -76,8 +77,11 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+LOG_TAG = ""  # "[w2] " in a managed worker, so interleaved output stays readable
+
+
 def log(message: str) -> None:
-    print(f"{now()} {message}", flush=True)
+    print(f"{now()} {LOG_TAG}{message}", flush=True)
 
 
 class Driver:
@@ -87,6 +91,7 @@ class Driver:
         self.board = board or Board(config.board)
         self.held: set[str] = set()
         self.last_session_end = 0.0
+        self.interrupted = False  # SIGINT/SIGTERM: stop like the STOP file, parking work and releasing the card
 
     # --- git and working tree ---------------------------------------------------------------------------------
 
@@ -173,12 +178,15 @@ class Driver:
                 self.board.unlink(parent, tid)
             if cid not in done and tasks[cid].get("status") == "todo" and all(d in done for d in card.depends):
                 self.board.promote(tid)
+            if cid in done and tasks[cid].get("status") == "blocked":
+                # Its commit reached the branch while the task was blocked: a parked card merged by hand.
+                self.board.complete(tid, f"commit on {self.config.land_to or self.config.branch}", "merged by hand")
         return self.board.tasks()
 
     # --- pacing and stop controls -----------------------------------------------------------------------------
 
     def stop_requested(self) -> bool:
-        return self.config.stop_file.exists() or self.config.pause_file.exists()
+        return self.interrupted or self.config.stop_file.exists() or self.config.pause_file.exists()
 
     def cooldown(self) -> int:
         """<log_dir>/COOLDOWN_S (an integer, at least 60) overrides the configured cooldown while running."""
@@ -226,7 +234,7 @@ class Driver:
                 if not announced:
                     log(f"all {len(slots)} model slot(s) busy ({', '.join(str(s.lock) for s in slots)}); waiting")
                     announced = True
-                if self.config.stop_file.exists():
+                if self.interrupted or self.config.stop_file.exists():
                     raise Stopped
                 if self.config.pause_file.exists():
                     yield None
@@ -557,6 +565,17 @@ class Driver:
                          f"tokens.\nRunner re-ran acceptance: {accept}\n{tail[-1] if tail else ''}")
                 shutil.rmtree(self.carry_dir(card.id), ignore_errors=True)
                 sha = self.git("rev-parse", "--short", "HEAD")
+                if self.config.land_to:
+                    landed, problem = self.land(card, logdir)
+                    if problem:
+                        branch = self.park(card, sha)
+                        log(f"{card.id}: PARKED on {branch}: {problem}")
+                        self.board.comment(tid, f"runner: {problem}. The work is saved on branch {branch} "
+                                                f"(commit {sha}); resolve with `git merge {branch}` on "
+                                                f"{self.config.land_to}, and the runner completes the card.")
+                        self.board.block(tid, f"runner: not merged into {self.config.land_to}; saved on {branch}")
+                        return False
+                    sha = landed
                 summary = {k: stats[k] for k in ("minutes", "tool_calls", "output_tokens", "acceptance", "touched")}
                 self.board.complete(tid, f"commit {sha}", f"{card.id} committed {sha}: " + json.dumps(summary))
                 return True
@@ -577,14 +596,100 @@ class Driver:
         self.board.block(tid, "runner: attempts exhausted; see the card comments and carried work")
         return False
 
+    # --- landing a worker's commit (managed worktrees) ---------------------------------------------------------
+
+    @contextmanager
+    def land_lock(self):
+        """One landing at a time per repository, across every worker."""
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        with (common / "dsh-runner-land.lock").open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def checkout_of(self, branch: str) -> Path | None:
+        """The worktree that has `branch` checked out, if any."""
+        path = None
+        for line in self.git("worktree", "list", "--porcelain").splitlines():
+            if line.startswith("worktree "):
+                path = Path(line[len("worktree "):])
+            elif line == f"branch refs/heads/{branch}":
+                return path
+        return None
+
+    def land(self, card: Card, logdir: Path) -> tuple[str, str]:
+        """Bring this worker's card commit onto `land_to`: (short sha there, "") or ("", what went wrong).
+
+        Merges `land_to` into the worker branch first, so `land_to` only ever fast-forwards and stays green.
+        A ref is never moved under a checkout: a checkout of `land_to` is fast-forwarded by git itself, which
+        refuses rather than overwrite local changes.
+        """
+        target = self.config.land_to
+        with self.land_lock():
+            old = self.git("rev-parse", target)
+            work = self.git("rev-parse", "HEAD")
+            merged = subprocess.run(["git", "-C", str(self.config.repo), "merge", "-q", "-m",
+                                     f"dsh-runner: merge {target} before landing {card.id}", target],
+                                    capture_output=True, text=True)
+            if merged.returncode:
+                files = self.git("diff", "--name-only", "--diff-filter=U", check=False).split()
+                self.git("merge", "--abort", check=False)
+                return "", f"merge conflict with {target} in {files or merged.stderr.strip()[-300:]}"
+            if self.git("rev-parse", "HEAD") != work:
+                ok, tail = self.acceptance(card.accept, logdir)
+                self.git("reset", "-q", "--hard", "HEAD")
+                self.git("clean", "-qfd")
+                if not ok:
+                    return "", f"acceptance fails after merging {target}: {tail[-1] if tail else ''}"
+            new = self.git("rev-parse", "HEAD")
+            checkout = self.checkout_of(target)
+            if checkout is not None:
+                moved = subprocess.run(["git", "-C", str(checkout), "merge", "-q", "--ff-only", new],
+                                       capture_output=True, text=True)
+                if moved.returncode:
+                    return "", f"could not fast-forward {target} in {checkout}: {moved.stderr.strip()[-300:]}"
+            elif subprocess.run(["git", "-C", str(self.config.repo), "update-ref", f"refs/heads/{target}", new, old],
+                                capture_output=True).returncode:
+                return "", f"{target} moved while landing"
+            return self.git("rev-parse", "--short", new), ""
+
+    def park(self, card: Card, sha: str) -> str:
+        """Save the card's commit on dsh/parked/<id> and put the worker back on `land_to`. Nothing is lost."""
+        branch = f"dsh/parked/{card.id}"
+        self.git("branch", "-f", branch, sha)
+        self.git("reset", "-q", "--hard", self.config.land_to)
+        return branch
+
+    def others_working(self, tasks: dict) -> list[str]:
+        """Cards that a live runner on this host is working on right now (its card lock is held)."""
+        busy = []
+        for cid, task in tasks.items():
+            if task.get("status") == "running" and task.get("assignee") == self.config.assignee:
+                handle = self.card_lock(cid)
+                if handle is None:
+                    busy.append(cid)
+                else:
+                    handle.close()
+        return busy
+
+    def wait_for_others(self, busy: list[str]) -> None:
+        log(f"other runners are working on {busy}; waiting for them")
+        deadline = time.time() + min(60, self.config.poll_s * 20)
+        while time.time() < deadline and not self.stop_requested():
+            time.sleep(min(3, self.config.poll_s))
+
     # --- main loop --------------------------------------------------------------------------------------------
 
     def prepare(self) -> None:
-        if self.config.planner_branch and self.git("rev-parse", "--verify", "-q", self.config.planner_branch, check=False):
-            ahead = self.git("rev-list", "--count", f"{self.config.branch}..{self.config.planner_branch}")
-            if ahead != "0":
-                self.git("merge", "-q", "--no-edit", self.config.planner_branch)
-                log(f"merged {ahead} planner commit(s)")
+        # A managed worker first catches up with what the other workers landed.
+        for source in (self.config.land_to, self.config.planner_branch):
+            if source and self.git("rev-parse", "--verify", "-q", source, check=False):
+                ahead = self.git("rev-list", "--count", f"HEAD..{source}")
+                if ahead != "0":
+                    self.git("merge", "-q", "--no-edit", source)
+                    log(f"merged {ahead} commit(s) from {source}")
         if self.config.setup:
             # Install dependencies outside DSH, which may run without network access.
             subprocess.run(self.config.setup, cwd=self.config.repo, env=self.config.worker_env(), check=True)
@@ -660,7 +765,26 @@ class Driver:
         if self.git("branch", "--show-current") != self.config.branch:
             sys.exit(f"{self.config.repo} must be on branch {self.config.branch}")
         self.config.log_path.mkdir(parents=True, exist_ok=True)
+        previous = {}
+
+        def interrupt(signum, frame):
+            if self.interrupted:  # a second Ctrl-C: give up on a clean stop
+                raise KeyboardInterrupt
+            self.interrupted = True
+            log("interrupted: stopping after parking the current card")
+
+        if threading.current_thread() is threading.main_thread():
+            previous = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            return self.loop(once, only)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    def loop(self, once: bool, only: str | None) -> int:
         while True:
+            if self.interrupted:
+                return 0
             if self.config.stop_file.exists():
                 log("STOP file present")
                 return 0
@@ -676,6 +800,10 @@ class Driver:
             tasks = self.sync_board(cards)
             runnable, reason = self.candidates(cards, tasks, only)
             if not runnable:
+                # A card still running elsewhere may unlock dependents; wait for it rather than exiting.
+                if not once and (busy := self.others_working(tasks)):
+                    self.wait_for_others(busy)
+                    continue
                 log(reason)
                 return 0
             card = None
@@ -706,10 +834,7 @@ class Driver:
                 if not busy or once:
                     log(reason or f"nothing to claim; other runners hold {busy}")
                     return 0
-                log(f"other runners hold {busy}; waiting for them")
-                deadline = time.time() + min(60, self.config.poll_s * 20)
-                while time.time() < deadline and not self.stop_requested():
-                    time.sleep(min(3, self.config.poll_s))
+                self.wait_for_others(busy)
                 continue
             if not ok:
                 log(f"{card.id} not completed; continuing with other ready cards")

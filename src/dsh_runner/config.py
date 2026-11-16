@@ -44,6 +44,10 @@ class Config:
     pause_file: Path = Path.home() / ".dsh-runner" / "PAUSE"
     model_lock: Path = Path.home() / ".dsh-runner" / "model.lock"
     slots: list[Slot] = field(default_factory=list)
+    workers: int = 1
+    # Set only for a managed worker (see workers.py): the branch its commits land on. Not a TOML key.
+    land_to: str = ""
+    config_file: Path | None = None
 
     @property
     def cards_path(self) -> Path:
@@ -92,7 +96,7 @@ class Config:
 # Which dataclass fields each TOML section may set; anything else is a typo and an error.
 SECTIONS = {
     "runner": ("board", "branch", "planner_branch", "assignee", "cards_dir", "card_pattern", "log_dir",
-               "setup", "ignored", "worker_rules", "env"),
+               "setup", "ignored", "worker_rules", "env", "workers"),
     "dsh": ("home", "bin"),
     "limits": ("run_timeout_min", "accept_timeout_min", "min_nudge_s", "attempts", "infra_retries",
                "infra_backoff_s", "cooldown_s", "poll_s", "pause_file", "model_lock"),
@@ -122,6 +126,9 @@ def load(repo: Path, path: Path | None = None) -> Config:
     if not runner.get("board"):
         raise SystemExit(f"{path}: [runner] board is required")
     config = Config(repo=repo.resolve(), **runner)
+    config.config_file = path.resolve()
+    if not isinstance(config.workers, int) or config.workers < 1:
+        raise SystemExit(f"{path}: [runner] workers must be a positive integer")
     for key, value in limits.items():
         setattr(config, key, _path(value) if key in PATHS else value)
     home = dsh.get("home") or os.environ.get("DSH_HOME")

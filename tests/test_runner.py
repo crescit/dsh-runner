@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from dsh_runner.cards import load_cards, parse_card  # noqa: E402
 from dsh_runner.config import load  # noqa: E402
 from dsh_runner.driver import Driver  # noqa: E402
+from dsh_runner.workers import ensure_worktree, worker_config  # noqa: E402
 
 FAKES = Path(__file__).resolve().parent / "fakes"
 CHECK = "import pathlib, sys\nsys.exit(0 if pathlib.Path('src/out.txt').read_text() == 'ok' else 1)\n"
@@ -292,6 +293,106 @@ class RunnerTest(unittest.TestCase):
         Path(os.environ["FAKE_HERMES_DB"]).write_text(json.dumps(db))
         self.assertEqual(driver.run(), 0)
         self.assertEqual(self.git("log", "-1", "--format=%s"), "A02: Second")
+
+    def worker(self, n, **patches):
+        base = load(self.repo)
+        ensure_worktree(base, n)
+        driver = Driver(worker_config(base, n))
+        for name, value in patches.items():
+            setattr(driver, name, value)
+        return driver
+
+    def lenient_check(self):
+        (self.repo / "tools" / "check.py").write_text("import pathlib, sys\nsys.exit(0)\n")
+        self.git("commit", "-qam", "lenient check")
+
+    def test_workers_land_their_commits_on_the_main_branch(self):
+        self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", allowed=["src/second.txt"]))
+        self.plan({"write": {"src/out.txt": "ok"}}, {"write": {"src/second.txt": "2"}})
+        w1, w2 = self.worker(1), self.worker(2)
+        self.assertEqual(w1.run(once=True), 0)
+        self.assertEqual(w2.run(once=True), 0)
+        self.assertEqual(self.git("log", "--format=%s", "-2").splitlines(), ["A02: Second", "A01: First"])
+        self.assertEqual((self.repo / "src" / "second.txt").read_text(), "2")  # the main checkout moved too
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.board()["A02"]["status"], "done")
+        self.assertTrue(self.board()["A02"]["result"].startswith("commit "))
+
+    def test_a_merge_conflict_parks_the_work_and_blocks_only_that_card(self):
+        self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second"),
+                          A03=card("A03", "Third", depends=["A02"], allowed=["src/third.txt"]))
+        self.lenient_check()
+        self.plan({"write": {"src/out.txt": "one"}}, {"write": {"src/out.txt": "two"}},
+                  {"write": {"src/third.txt": "3"}})
+        w1 = self.worker(1)
+        w2 = self.worker(2, prepare=lambda: None)  # still behind main, as if it started before A01 landed
+        self.assertEqual(w1.run(once=True, only="A01"), 0)
+        self.assertEqual(w2.run(once=True, only="A02"), 0)
+        self.assertEqual(self.git("show", "dsh/parked/A02:src/out.txt"), "two")  # the work is saved
+        self.assertEqual(self.git("show", "main:src/out.txt"), "one")
+        self.assertEqual(self.board()["A02"]["status"], "blocked")
+        self.assertTrue(any("merge conflict" in c and "src/out.txt" in c for c in self.board()["A02"]["comments"]))
+        self.assertEqual(self.git("-C", str(w2.config.repo), "rev-parse", "HEAD"), self.git("rev-parse", "main"))
+        self.assertEqual(self.worker(1).run(), 0)  # A03 waits for its parked dependency
+        self.assertNotEqual(self.board()["A03"]["status"], "done")
+        # A human resolves the conflict on main; the runner completes A02 and moves on to A03.
+        self.git("merge", "-q", "-X", "theirs", "--no-edit", "dsh/parked/A02")
+        self.assertEqual(self.worker(1).run(), 0)
+        self.assertEqual(self.board()["A02"]["status"], "done")
+        self.assertEqual(self.board()["A03"]["status"], "done")
+
+    def test_local_changes_in_the_main_checkout_are_never_overwritten(self):
+        self.commit_cards(A01=card("A01", "First"))
+        (self.repo / "README.md").write_text("my edit\n")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "out.txt").write_text("mine")  # untracked, in the way of the card's file
+        self.plan({"write": {"src/out.txt": "ok"}})
+        self.assertEqual(self.worker(1).run(once=True), 0)
+        self.assertEqual((self.repo / "src" / "out.txt").read_text(), "mine")
+        self.assertEqual((self.repo / "README.md").read_text(), "my edit\n")
+        self.assertEqual(self.git("log", "-1", "--format=%s", "main"), "cards")
+        self.assertEqual(self.git("show", "dsh/parked/A01:src/out.txt"), "ok")
+        self.assertEqual(self.board()["A01"]["status"], "blocked")
+
+    def test_main_branch_checked_out_nowhere_is_updated_by_ref(self):
+        self.commit_cards(A01=card("A01", "First"))
+        self.git("checkout", "-q", "-b", "elsewhere")
+        self.plan({"write": {"src/out.txt": "ok"}})
+        self.assertEqual(self.worker(1).run(once=True), 0)
+        self.assertEqual(self.git("log", "-1", "--format=%s", "main"), "A01: First")
+        self.assertEqual(self.git("branch", "--show-current"), "elsewhere")
+
+    def test_leftovers_in_a_reused_worktree_are_salvaged(self):
+        self.commit_cards(A01=card("A01", "First"))
+        base = load(self.repo)
+        path = ensure_worktree(base, 1)
+        (path / "half-done.txt").write_text("unsaved")
+        ensure_worktree(base, 1)
+        self.assertFalse((path / "half-done.txt").exists())
+        salvage = [b.strip() for b in self.git("branch", "--list", "dsh/salvage/*").splitlines()]
+        self.assertEqual(len(salvage), 1)
+        self.assertEqual(self.git("show", f"{salvage[0]}:half-done.txt"), "unsaved")
+
+    def test_run_workers_runs_cards_in_parallel_worktrees(self):
+        from dsh_runner import cli
+        self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", allowed=["src/second.txt"]))
+        self.add_slots()
+        self.lenient_check()
+        self.plan(*[{"write_allowed": "ok"}] * 4)  # sessions run concurrently, in either order
+        with patch.dict(os.environ, PYTHONPATH=str(ROOT / "src")):
+            self.assertEqual(cli.main(["-C", str(self.repo), "run", "--workers", "2"]), 0)
+        subjects = self.git("log", "--format=%s", "main").splitlines()
+        self.assertIn("A01: First", subjects)
+        self.assertIn("A02: Second", subjects)
+        self.assertEqual({self.board()[c]["status"] for c in ("A01", "A02")}, {"done"})
+
+    def test_an_interrupted_runner_starts_no_session(self):
+        self.commit_cards(A01=card("A01", "First"))
+        self.plan({"write": {"src/out.txt": "ok"}})
+        driver = Driver(load(self.repo))
+        driver.interrupted = True
+        self.assertEqual(driver.loop(False, None), 0)
+        self.assertFalse(Path(os.environ["FAKE_DSH_PLAN"] + ".count").exists())
 
     def test_sync_is_idempotent(self):
         self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", depends=["A01"]))
