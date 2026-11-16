@@ -83,6 +83,7 @@ real local model. Expect rough edges, and please open an issue when you hit one.
    dsh-runner run              # until no ready cards remain
    dsh-runner run --once       # a single card
    dsh-runner run --card A03   # just this card
+   dsh-runner run --workers 2  # two workers in managed worktrees (see Parallel runners)
    ```
 
    The runner refuses to start on the wrong branch or with uncommitted changes, because it needs to tell the
@@ -156,13 +157,14 @@ See [`examples/cards/A01-example.md`](examples/cards/A01-example.md).
 | Pause every runner on the machine | `touch ~/.dsh-runner/PAUSE` (configurable `pause_file`; remove it to resume) |
 | Lengthen the gap between sessions | `echo 300 > runs/board/COOLDOWN_S` (seconds, minimum 60; read live) |
 | Share one model server between repos | Point their `model_lock` at the same file, and the runners take turns |
+| Run several workers in parallel | `dsh-runner run --workers 2` with one `[[slots]]` entry per model session; see below |
 
 STOP takes effect immediately: a running session is killed, the card's partial edits are saved under
 `runs/board/<id>/carry/` and reverted, the task is released, and the runner exits. The attempt is not counted, and
 the next run restores those edits and tells the model what earlier attempts found.
 
-PAUSE does the same to a runner that is mid-session, which then exits. A runner that is between cards waits until
-the file is removed.
+PAUSE does the same to a runner that is mid-session, which then exits. A runner that is between cards, or waiting
+for a model slot, waits until the file is removed.
 
 If the model server is unreachable (DSH exits with an error and no output), the runner retries with backoff
 without counting an attempt. If it is still down, it releases the card and exits with status 3. A `dsh` that
@@ -172,9 +174,56 @@ environment the runner uses (service manager, cron, `nohup`) to catch this befor
 
 | Exit status | Meaning |
 |---|---|
-| 0 | No ready cards remain, only gates remain, `--once`/`--card` finished, or STOP/PAUSE stopped the runner |
+| 0 | No ready cards remain, only gates remain, `--once`/`--card` finished, or STOP/PAUSE/Ctrl-C stopped the runner |
 | 1 | Refused to run: wrong branch, uncommitted changes, a configuration error, or `dsh` cannot be launched at all (for example its `node` is not on `PATH`); the message says which, and the card is released |
 | 3 | The model server was unreachable; the card was released, not blocked |
+
+## Parallel runners
+
+One command runs several workers from one repository:
+
+```bash
+dsh-runner run --workers 2      # or set [runner] workers = 2
+```
+
+Give the config one `[[slots]]` entry per model session your server can run at once (a llama.cpp server started
+with `--parallel 4` has four), and use the same list in every project that shares that server:
+
+```toml
+[[slots]]
+lock = "~/.dsh-runner/model.lock"
+home = "~/.dsh-ml-infra"         # DSH home whose headless profile points at this server (default: [dsh] home)
+[[slots]]
+lock = "~/.dsh-runner/model2.lock"
+home = "~/.dsh-ml-infra"
+```
+
+Without `[[slots]]` there is one slot made from `model_lock` and `[dsh] home`, as before. Workers beyond the number
+of slots would only wait, so the runner starts at most that many.
+
+**Worktrees are managed for you.** Worker *n* runs in its own git worktree on branch `dsh/w<n>`, under
+`<slot lock dir>/worktrees/<board>/w<n>`, outside the repository. Each start resets them to `branch`; anything a
+crashed worker left behind is first committed to a `dsh/salvage/w<n>-<time>` branch. `setup` runs in each worktree.
+Workers share the main `log_dir`, so one STOP file stops them all and carried work resumes on any worker.
+
+**Landing.** After a card passes, its worker merges `branch` into its own branch, re-runs the acceptance command if
+that brought in new commits, and fast-forwards `branch`. If `branch` is checked out (your main checkout), git
+fast-forwards that checkout itself and refuses rather than overwrite your local changes. Landings take turns.
+
+**Conflicts never lose work.** If the merge conflicts, the merged acceptance run fails, or your checkout's local
+changes are in the way, the commit is kept on `dsh/parked/<id>`. The card is blocked with a comment naming the
+files and the branch, the worker goes back to `branch`, and other cards keep running. Cards that depend on it wait.
+To resolve, merge it yourself (`git merge dsh/parked/A03` on `branch`); the next pass sees the commit, completes
+the card on the board and runs its dependents.
+
+**Also:**
+- A runner takes a model slot before it claims a card, and holds a per-card lock while it works, so two workers
+  (or runners in separate clones) never take the same card. Hermes' own atomic claim covers other machines.
+- A task left `running` by a runner that died is reclaimed and resumed from its carried work.
+- A card waits until its dependencies' runner commits are on its branch, and a runner waits, rather than exits,
+  while other runners are working on cards that could unblock it.
+- Ctrl-C (or SIGTERM) stops like STOP: partial edits are carried, the card is released. A second Ctrl-C kills.
+- Every runner sharing a board or slots must be on this version: an older one takes no card locks.
 
 ## Configuration
 

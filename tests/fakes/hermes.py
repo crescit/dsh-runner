@@ -1,5 +1,6 @@
 """Fake `hermes kanban` CLI backed by a JSON file ($FAKE_HERMES_DB), covering the commands dsh-runner uses."""
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,8 @@ def main(argv):
     parser.add_argument("command")
     parser.add_argument("rest", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv[1:])
+    lock = open(str(DB) + ".lock", "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)  # several workers may call at once
     db = load()
     tasks = db["tasks"]
     rest = args.rest
@@ -32,7 +35,7 @@ def main(argv):
         return rest[rest.index(name) + 1] if name in rest else default
 
     if args.command == "list":
-        print(json.dumps([{k: t[k] for k in ("id", "title", "status", "assignee")} for t in tasks.values()]))
+        print(json.dumps([{k: t[k] for k in ("id", "title", "status", "assignee", "result")} for t in tasks.values()]))
     elif args.command == "create":
         key = flag("--idempotency-key")
         if any(t.get("key") == key for t in tasks.values()):
@@ -40,7 +43,7 @@ def main(argv):
         tid = f"t_{db['next']:04d}"
         db["next"] += 1
         tasks[tid] = {"id": tid, "title": rest[0], "body": flag("--body", ""), "assignee": flag("--assignee"),
-                      "status": "ready", "parents": [], "comments": [], "key": key}
+                      "status": "ready", "parents": [], "comments": [], "key": key, "result": None}
     elif args.command == "show":
         task = tasks[rest[0]]
         print(json.dumps({"task": task, "parents": task["parents"]}))
@@ -58,6 +61,9 @@ def main(argv):
     elif args.command == "promote":
         tasks[rest[0]]["status"] = "ready"
     elif args.command == "claim":
+        # Like Hermes: an atomic ready -> running swap that fails for anything else.
+        if tasks[rest[0]]["status"] != "ready":
+            sys.exit(f"cannot claim {rest[0]}: status={tasks[rest[0]]['status']}")
         tasks[rest[0]]["status"] = "running"
     elif args.command == "comment":
         tasks[rest[0]]["comments"].append(rest[1])

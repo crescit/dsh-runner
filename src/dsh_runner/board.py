@@ -54,8 +54,9 @@ class Board:
     def promote(self, task_id: str) -> None:
         self.run("promote", task_id)
 
-    def claim(self, task_id: str, ttl_s: int) -> None:
-        self.run("claim", task_id, "--ttl", str(ttl_s))
+    def claim(self, task_id: str, ttl_s: int) -> bool:
+        """Hermes claims atomically (ready -> running) and fails when another claimer got there first."""
+        return self.run("claim", task_id, "--ttl", str(ttl_s)).returncode == 0
 
     def comment(self, task_id: str, text: str) -> None:
         self.run("comment", task_id, text)

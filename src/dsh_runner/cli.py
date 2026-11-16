@@ -11,6 +11,7 @@ from . import __version__
 from .cards import load_cards
 from .config import load
 from .driver import Driver
+from .workers import supervise, worker_config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,11 +23,21 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run", help="run ready cards until none remain (or one with --once)")
     run.add_argument("--once", action="store_true", help="run at most one card")
     run.add_argument("--card", help="run only this card id")
+    run.add_argument("--workers", type=int, help="run this many workers in managed worktrees (default: [runner] workers)")
+    run.add_argument("--worker", type=int, help=argparse.SUPPRESS)  # set by the supervisor
     sub.add_parser("sync", help="mirror card files onto the board and exit")
     sub.add_parser("check", help="validate config, cards and tools without running anything")
     args = parser.parse_args(argv)
 
     config = load(args.repo.resolve(), args.config)
+    if args.command == "run":
+        if args.worker:
+            from . import driver as driver_module
+            driver_module.LOG_TAG = f"[w{args.worker}] "
+            return Driver(worker_config(config, args.worker)).run(once=args.once)
+        workers = args.workers or config.workers
+        if workers > 1 and not args.card:
+            return supervise(config, workers, args.once)
     driver = Driver(config)
     if args.command == "sync":
         tasks = driver.sync_board(load_cards(config.cards_path, config.card_pattern))
@@ -67,6 +78,10 @@ def check(driver: Driver) -> int:
     if not shutil.which(driver.board.hermes):
         problems.append("hermes not found: install Hermes Agent or set DSH_RUNNER_HERMES")
     print(f"model    {driver.dsh_setting('model')} (headless profile default)")
+    for slot in config.model_slots():
+        print(f"slot     {slot.lock} -> DSH_HOME {slot.home}")
+        if not slot.home.is_dir():
+            problems.append(f"slot {slot.lock}: DSH home {slot.home} does not exist")
     for problem in problems:
         print(f"problem: {problem}", file=sys.stderr)
     print("ok" if not problems else f"{len(problems)} problem(s)")
