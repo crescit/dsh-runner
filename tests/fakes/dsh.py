@@ -25,6 +25,7 @@ index = int(counter.read_text()) if counter.exists() else 0
 counter.write_text(str(index + 1))
 prompt = sys.stdin.read()
 Path(os.environ["FAKE_DSH_PLAN"] + f".prompt{index}").write_text(prompt)
+Path(os.environ["FAKE_DSH_PLAN"] + f".home{index}").write_text(os.environ.get("DSH_HOME", ""))
 step = plan[index] if index < len(plan) else {}
 
 if step.get("silent_fail"):

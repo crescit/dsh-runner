@@ -156,13 +156,14 @@ See [`examples/cards/A01-example.md`](examples/cards/A01-example.md).
 | Pause every runner on the machine | `touch ~/.dsh-runner/PAUSE` (configurable `pause_file`; remove it to resume) |
 | Lengthen the gap between sessions | `echo 300 > runs/board/COOLDOWN_S` (seconds, minimum 60; read live) |
 | Share one model server between repos | Point their `model_lock` at the same file, and the runners take turns |
+| Run several workers in parallel | List one `[[slots]]` per model server (or per parallel slot of one server); see below |
 
 STOP takes effect immediately: a running session is killed, the card's partial edits are saved under
 `runs/board/<id>/carry/` and reverted, the task is released, and the runner exits. The attempt is not counted, and
 the next run restores those edits and tells the model what earlier attempts found.
 
-PAUSE does the same to a runner that is mid-session, which then exits. A runner that is between cards waits until
-the file is removed.
+PAUSE does the same to a runner that is mid-session, which then exits. A runner that is between cards, or waiting
+for a model slot, waits until the file is removed.
 
 If the model server is unreachable (DSH exits with an error and no output), the runner retries with backoff
 without counting an attempt. If it is still down, it releases the card and exits with status 3. A `dsh` that
@@ -175,6 +176,34 @@ environment the runner uses (service manager, cron, `nohup`) to catch this befor
 | 0 | No ready cards remain, only gates remain, `--once`/`--card` finished, or STOP/PAUSE stopped the runner |
 | 1 | Refused to run: wrong branch, uncommitted changes, a configuration error, or `dsh` cannot be launched at all (for example its `node` is not on `PATH`); the message says which, and the card is released |
 | 3 | The model server was unreachable; the card was released, not blocked |
+
+## Parallel runners
+
+Several runners can share one board, each in its own checkout: a clone, or a `git worktree` on its own branch (two
+worktrees cannot both have `main` checked out). Give every runner the same `[[slots]]` list, one entry per model
+session your hardware can serve at once:
+
+```toml
+[[slots]]
+lock = "~/.dsh-runner/ornith-1.lock"
+home = "~/.dsh-ml-infra"         # DSH home whose headless profile points at this server (default: [dsh] home)
+[[slots]]
+lock = "~/.dsh-runner/ornith-2.lock"
+home = "~/.dsh-ornith-2"         # or the same home, if one server runs two parallel slots
+```
+
+Without `[[slots]]` the runner has one slot made from `model_lock` and `[dsh] home`, as before.
+
+- A runner takes the first free slot, then claims a card. A runner waiting for a slot holds no card.
+- Each card has a lock file under `<slot lock dir>/claims/<board>/`, held for as long as a runner works on it, so
+  runners on the same machine never pick the same card. Hermes' own atomic claim covers runners on other machines.
+- A task left `running` by a runner that died (its lock is free and its assignee is this runner's) is reclaimed
+  and run again; the carried work resumes.
+- A card waits until the runner commits of its dependencies are on this checkout's branch, so it never builds on
+  code it does not have. Use `planner_branch` to merge a shared branch in before each card. Dependencies completed
+  by hand count as soon as the board says they are done.
+- When the only ready cards are held by other runners, a runner waits for them instead of exiting.
+- Every runner must be on this version: an older runner takes no card locks.
 
 ## Configuration
 

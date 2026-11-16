@@ -67,6 +67,10 @@ def check(driver: Driver) -> int:
     if not shutil.which(driver.board.hermes):
         problems.append("hermes not found: install Hermes Agent or set DSH_RUNNER_HERMES")
     print(f"model    {driver.dsh_setting('model')} (headless profile default)")
+    for slot in config.model_slots():
+        print(f"slot     {slot.lock} -> DSH_HOME {slot.home}")
+        if not slot.home.is_dir():
+            problems.append(f"slot {slot.lock}: DSH home {slot.home} does not exist")
     for problem in problems:
         print(f"problem: {problem}", file=sys.stderr)
     print("ok" if not problems else f"{len(problems)} problem(s)")

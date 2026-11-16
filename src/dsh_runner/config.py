@@ -11,6 +11,13 @@ CONFIG_NAME = "dsh-runner.toml"
 
 
 @dataclass
+class Slot:
+    """One model session at a time per slot: a lock file, and the DSH home whose profile points at that server."""
+    lock: Path
+    home: Path
+
+
+@dataclass
 class Config:
     repo: Path
     board: str
@@ -36,6 +43,7 @@ class Config:
     poll_s: float = 3.0
     pause_file: Path = Path.home() / ".dsh-runner" / "PAUSE"
     model_lock: Path = Path.home() / ".dsh-runner" / "model.lock"
+    slots: list[Slot] = field(default_factory=list)
 
     @property
     def cards_path(self) -> Path:
@@ -53,6 +61,15 @@ class Config:
     def always_ignored(self) -> tuple[str, ...]:
         # The runner's own logs never count as worker edits.
         return tuple(dict.fromkeys([self.log_dir.rstrip("/") + "/", *self.ignored]))
+
+    def model_slots(self) -> list[Slot]:
+        """The [[slots]] list, or the single slot that `model_lock` and `[dsh] home` describe."""
+        return self.slots or [Slot(self.model_lock, self.dsh_home)]
+
+    @property
+    def claims_path(self) -> Path:
+        """Per-card lock files shared by every runner on this host that works on the same board."""
+        return self.model_slots()[0].lock.parent / "claims" / self.board
 
     def dsh_command(self) -> str:
         if self.dsh_bin:
@@ -81,6 +98,7 @@ SECTIONS = {
                "infra_backoff_s", "cooldown_s", "poll_s", "pause_file", "model_lock"),
 }
 PATHS = {"pause_file", "model_lock"}
+SLOT_KEYS = ("lock", "home")
 
 
 def _path(value: str) -> Path:
@@ -92,7 +110,11 @@ def load(repo: Path, path: Path | None = None) -> Config:
     if not path.is_file():
         raise SystemExit(f"no {CONFIG_NAME} at {path}; copy examples/{CONFIG_NAME} and edit it")
     data = tomllib.loads(path.read_text())
+    slots = data.pop("slots", [])
+    if not isinstance(slots, list) or not all(isinstance(slot, dict) for slot in slots):
+        raise SystemExit(f"{path}: slots must be [[slots]] tables")
     unknown = [f"[{name}]" for name in data if name not in SECTIONS]
+    unknown += [f"slots.{key}" for slot in slots for key in slot if key not in SLOT_KEYS]
     unknown += [f"{name}.{key}" for name, keys in SECTIONS.items() for key in data.get(name, {}) if key not in keys]
     if unknown:
         raise SystemExit(f"{path}: unknown setting(s): {', '.join(unknown)}")
@@ -106,4 +128,8 @@ def load(repo: Path, path: Path | None = None) -> Config:
     if home:
         config.dsh_home = _path(home)
     config.dsh_bin = dsh.get("bin", "")
+    for slot in slots:
+        if not slot.get("lock"):
+            raise SystemExit(f"{path}: every [[slots]] entry needs a lock")
+        config.slots.append(Slot(_path(slot["lock"]), _path(slot["home"]) if slot.get("home") else config.dsh_home))
     return config

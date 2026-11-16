@@ -1,4 +1,5 @@
 """End-to-end: the real runner against a temporary git repo, a fake Hermes board and a scripted fake DSH."""
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -51,6 +52,7 @@ class RunnerTest(unittest.TestCase):
         self.addCleanup(env.stop)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         (self.repo / "docs" / "cards").mkdir(parents=True)
+        (self.tmp / "dsh-home").mkdir()
         (self.repo / "tools").mkdir()
         (self.repo / "tools" / "check.py").write_text(CHECK)
         (self.repo / "README.md").write_text("original\n")
@@ -199,6 +201,97 @@ class RunnerTest(unittest.TestCase):
         (self.repo / "README.md").write_text("local edit\n")
         with self.assertRaises(SystemExit):
             self.run_driver()
+
+    def hold(self, path):
+        """Hold a flock on path for the rest of the test, like a live runner in another process."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a")
+        self.addCleanup(handle.close)
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def add_slots(self):
+        config = self.repo / "dsh-runner.toml"
+        config.write_text(config.read_text() + textwrap.dedent(f"""\
+            [[slots]]
+            lock = "{self.tmp / 'slot1.lock'}"
+            [[slots]]
+            lock = "{self.tmp / 'slot2.lock'}"
+            home = "{self.tmp / 'dsh-home-2'}"
+            """))
+
+    def test_slots_parse_and_default_to_the_single_model_lock(self):
+        self.commit_cards(A01=card("A01", "Write ok"))
+        legacy = load(self.repo).model_slots()
+        self.assertEqual([(s.lock.name, s.home.name) for s in legacy], [("model.lock", "dsh-home")])
+        self.add_slots()
+        slots = load(self.repo).model_slots()
+        self.assertEqual([(s.lock.name, s.home.name) for s in slots],
+                         [("slot1.lock", "dsh-home"), ("slot2.lock", "dsh-home-2")])
+        config = self.repo / "dsh-runner.toml"
+        config.write_text(config.read_text() + '[[slots]]\nlock = "x"\nhost = "y"\n')
+        with self.assertRaisesRegex(SystemExit, "slots.host"):
+            load(self.repo)
+
+    def test_a_busy_slot_sends_the_session_to_the_next_one(self):
+        self.commit_cards(A01=card("A01", "Write ok"))
+        self.add_slots()
+        self.git("commit", "-qam", "two slots")
+        self.hold(self.tmp / "slot1.lock")
+        self.plan({"write": {"src/out.txt": "ok"}})
+        self.assertEqual(self.run_driver(), 0)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "A01: Write ok")
+        self.assertEqual(Path(os.environ["FAKE_DSH_PLAN"] + ".home0").read_text(), str(self.tmp / "dsh-home-2"))
+
+    def test_pause_while_every_slot_is_busy_claims_nothing(self):
+        self.commit_cards(A01=card("A01", "Write ok"))
+        self.hold(self.tmp / "model.lock")
+        driver = Driver(load(self.repo))
+        (self.tmp / "PAUSE").touch()
+        with driver.model_slot() as slot:
+            self.assertIsNone(slot)
+        self.assertEqual(driver.config.dsh_home, driver.base.dsh_home)
+
+    def test_a_card_another_live_runner_owns_is_skipped(self):
+        self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", allowed=["src/second.txt"]))
+        driver = Driver(load(self.repo))
+        driver.sync_board(load_cards(driver.config.cards_path, driver.config.card_pattern))
+        driver.board.claim(self.board()["A01"]["id"], 60)
+        self.hold(driver.config.claims_path / "A01.lock")
+        self.plan({"write": {"src/second.txt": "2"}})
+        check2 = "import pathlib, sys\nsys.exit(0 if pathlib.Path('src/second.txt').exists() else 1)\n"
+        (self.repo / "tools" / "check.py").write_text(check2)
+        self.git("commit", "-qam", "check second")
+        self.assertEqual(driver.run(once=True), 0)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "A02: Second")
+        self.assertEqual(self.board()["A01"]["status"], "running")
+        self.assertEqual(Path(os.environ["FAKE_DSH_PLAN"] + ".count").read_text(), "1")
+
+    def test_a_claim_left_by_a_dead_runner_is_taken_over(self):
+        self.commit_cards(A01=card("A01", "Write ok"))
+        driver = Driver(load(self.repo))
+        driver.sync_board(load_cards(driver.config.cards_path, driver.config.card_pattern))
+        driver.board.claim(self.board()["A01"]["id"], 60)  # its runner then died: no card lock is held
+        self.plan({"write": {"src/out.txt": "ok"}})
+        self.assertEqual(driver.run(), 0)
+        self.assertEqual(self.board()["A01"]["status"], "done")
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "A01: Write ok")
+
+    def test_a_dependency_committed_elsewhere_waits_for_the_merge(self):
+        self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", depends=["A01"]))
+        driver = Driver(load(self.repo))
+        driver.sync_board(load_cards(driver.config.cards_path, driver.config.card_pattern))
+        a01 = self.board()["A01"]["id"]
+        driver.board.claim(a01, 60)
+        driver.board.complete(a01, "commit abc1234", "done in another worktree")
+        self.plan({"write": {"src/out.txt": "ok"}})
+        self.assertEqual(driver.run(), 0)
+        self.assertFalse(Path(os.environ["FAKE_DSH_PLAN"] + ".count").exists())
+        # Completed by hand (no runner commit): the dependent card runs.
+        db = json.loads(Path(os.environ["FAKE_HERMES_DB"]).read_text())
+        db["tasks"][a01]["result"] = "done by hand"
+        Path(os.environ["FAKE_HERMES_DB"]).write_text(json.dumps(db))
+        self.assertEqual(driver.run(), 0)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "A02: Second")
 
     def test_sync_is_idempotent(self):
         self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", depends=["A01"]))

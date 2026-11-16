@@ -1,9 +1,10 @@
-"""Serial card driver: runs kanban cards through DSH headless and verifies the result.
+"""Card driver: runs kanban cards through DSH headless and verifies the result.
 
-One card at a time, on the configured branch of the repository:
+Each runner works one card at a time in its own checkout; several runners (clones or worktrees on their own branches)
+can share a board and a pool of model slots. Per card:
   1. merge new planner commits (optional planner branch) and run the setup command;
   2. mirror card files onto the Hermes kanban board (idempotent);
-  3. pick the first non-gate card whose dependencies are done;
+  3. take a free model slot, then claim the first non-gate card whose dependencies have landed here;
   4. run DSH headless; the worker edits files but never commits;
   5. verify: only `allowed` files changed and the acceptance command passes when the driver re-runs it;
   6. commit on the worker's behalf and complete the card, or retry, then block it and move on.
@@ -11,6 +12,7 @@ One card at a time, on the configured branch of the repository:
 from __future__ import annotations
 
 from contextlib import contextmanager
+import dataclasses
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -27,7 +29,7 @@ import time
 
 from .board import Board
 from .cards import Card, load_cards
-from .config import Config
+from .config import Config, Slot
 
 HEADER = """RUNNER NOTE (read first)
 - You are the worker model running in the DSH headless harness. There are NO kanban tools: ignore any mention of kanban.
@@ -80,6 +82,7 @@ def log(message: str) -> None:
 
 class Driver:
     def __init__(self, config: Config, board: Board | None = None):
+        self.base = config
         self.config = config
         self.board = board or Board(config.board)
         self.held: set[str] = set()
@@ -130,6 +133,21 @@ class Driver:
                 done.add(subjects[line.strip()])
         return done
 
+    def landed_ids(self, cards: dict[str, Card]) -> set[str]:
+        """Cards whose commit is on this checkout's branch, so later cards can build on the code."""
+        subjects = {f"{cid}: {card.title}": cid for cid, card in cards.items()}
+        return {subjects[line.strip()] for line in self.git("log", "--format=%s", "HEAD", check=False).splitlines()
+                if line.strip() in subjects}
+
+    @staticmethod
+    def unmerged(card: Card, done: set[str], landed: set[str], tasks: dict) -> list[str]:
+        """Dependencies that are done but whose runner commit has not reached this branch yet.
+
+        A dependency completed by hand (no `commit <sha>` result) counts as soon as the board says it is done.
+        """
+        return [d for d in card.depends if d in done and d not in landed
+                and str(tasks.get(d, {}).get("result") or "").startswith("commit ")]
+
     def sync_board(self, cards: dict[str, Card]) -> dict:
         """Mirror the card files: create missing tasks, set dependency links exactly, promote ready ones."""
         tasks = self.board.tasks()
@@ -179,26 +197,63 @@ class Driver:
         return True
 
     @contextmanager
-    def model_lock(self):
-        """One runner per model host: runners sharing a lock file take turns instead of overloading it."""
-        self.config.model_lock.parent.mkdir(parents=True, exist_ok=True)
-        with self.config.model_lock.open("a") as handle:
+    def model_slot(self):
+        """Take the first free model slot (non-blocking flock on its lock file) and point DSH at its home.
+
+        Runners sharing lock files take turns per model server instead of overloading it. Yields the slot, or None
+        when PAUSE appears while every slot is busy, so the caller goes back to waiting out the pause.
+        """
+        slots = self.base.model_slots()
+        handles = []
+        try:
+            for slot in slots:
+                slot.lock.parent.mkdir(parents=True, exist_ok=True)
+                handles.append(slot.lock.open("a"))
             announced = False
             while True:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if not announced:
-                        log(f"another runner holds {self.config.model_lock}; waiting")
-                        announced = True
-                    if self.stop_requested():
-                        raise Stopped
-                    time.sleep(30)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                for slot, handle in zip(slots, handles):
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    self.config = dataclasses.replace(self.base, dsh_home=slot.home)
+                    try:
+                        yield slot
+                    finally:
+                        self.config = self.base
+                        fcntl.flock(handle, fcntl.LOCK_UN)
+                    return
+                if not announced:
+                    log(f"all {len(slots)} model slot(s) busy ({', '.join(str(s.lock) for s in slots)}); waiting")
+                    announced = True
+                if self.config.stop_file.exists():
+                    raise Stopped
+                if self.config.pause_file.exists():
+                    yield None
+                    return
+                time.sleep(min(30, self.config.poll_s * 10))
+        finally:
+            for handle in handles:
+                handle.close()
+
+    def card_lock(self, cid: str):
+        """An open, flock-held file while this runner owns the card; None when another runner on this host does.
+
+        The kernel drops the lock when its process dies, so a held lock always means a live owner.
+        """
+        self.config.claims_path.mkdir(parents=True, exist_ok=True)
+        handle = (self.config.claims_path / f"{cid}.lock").open("a")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            handle.close()
+            return None
+
+    def claim_ttl(self) -> int:
+        run_s = self.config.run_timeout_min * 60
+        return (self.config.attempts * (run_s + self.config.accept_timeout_min * 60) +
+                self.config.infra_backoff_s * 2 ** self.config.infra_retries)
 
     # --- DSH sessions -----------------------------------------------------------------------------------------
 
@@ -410,8 +465,6 @@ class Driver:
             raise ValueError("Invalid card: " + "; ".join(gaps))
         tid, allowed, accept = task["id"], card.allowed, card.accept
         run_s = self.config.run_timeout_min * 60
-        self.board.claim(tid, self.config.attempts * (run_s + self.config.accept_timeout_min * 60) +
-                         self.config.infra_backoff_s * 2 ** self.config.infra_retries)
         model, effort = self.dsh_setting("model"), self.dsh_setting("reasoningEffort")
         self.board.comment(tid, f"runner: start {card.id} at {self.git('rev-parse', '--short', 'HEAD')} "
                                        f"(DSH {model}, effort {effort})")
@@ -536,29 +589,72 @@ class Driver:
             # Install dependencies outside DSH, which may run without network access.
             subprocess.run(self.config.setup, cwd=self.config.repo, env=self.config.worker_env(), check=True)
 
-    def next_card(self, cards: dict[str, Card], tasks: dict, only: str | None) -> tuple[Card | None, str]:
+    def candidates(self, cards: dict[str, Card], tasks: dict, only: str | None) -> tuple[list[Card], str]:
+        """Runnable cards in order (dependencies landed, not blocked, not a gate, valid), or why there are none."""
         done = self.done_ids(tasks, cards)
+        landed = self.landed_ids(cards)
         pending = [card for cid, card in sorted(cards.items()) if cid not in done]
         if only:
             pending = [card for card in pending if card.id == only]
-        ready = [card for card in pending if all(d in done for d in card.depends)
-                 and tasks.get(card.id, {}).get("status") != "blocked"]
+        ready, merging = [], {}
+        for card in pending:
+            if not all(d in done for d in card.depends) or tasks.get(card.id, {}).get("status") == "blocked":
+                continue
+            if waiting := self.unmerged(card, done, landed, tasks):
+                merging[card.id] = waiting
+            else:
+                ready.append(card)
         if not ready:
-            return None, f"no ready cards; pending: {[c.id for c in pending]}"
+            if merging:
+                return [], f"waiting for dependencies to be merged into {self.config.branch}: {merging}"
+            return [], f"no ready cards; pending: {[c.id for c in pending]}"
         runnable = [card for card in ready if not card.gate]
         if not runnable:
-            return None, f"stopping at gate(s): {[c.id for c in ready]}"
+            return [], f"stopping at gate(s): {[c.id for c in ready]}"
+        valid = []
         for card in runnable:
             gaps = self.invalid_card(card)
             if not gaps:
-                return card, ""
-            if card.id not in self.held:
+                valid.append(card)
+            elif card.id not in self.held:
                 self.held.add(card.id)
                 tid = tasks[card.id]["id"]
                 self.board.comment(tid, f"runner: HELD until the card is fixed: {gaps}")
                 self.board.block(tid, "runner: invalid acceptance inputs")
                 log(f"held {card.id}: {gaps}")
-        return None, f"no runnable cards; held: {sorted(self.held)}"
+        return valid, "" if valid else f"no runnable cards; held: {sorted(self.held)}"
+
+    def claim_next(self, runnable: list[Card], tasks: dict):
+        """Claim the first card no other runner owns: (card, task, lock handle, cards busy elsewhere)."""
+        busy = []
+        for card in runnable:
+            task = tasks.get(card.id)
+            if task is None:
+                sys.exit(f"card {card.id} missing on board {self.config.board}")
+            handle = self.card_lock(card.id)
+            if handle is None:
+                busy.append(card.id)
+                continue
+            tid = task["id"]
+            if task.get("status") == "running":
+                if task.get("assignee") != self.config.assignee:
+                    handle.close()
+                    busy.append(card.id)
+                    continue
+                # Running with our assignee but no live runner holds its lock: the runner died; take it over.
+                log(f"{card.id}: claimed by a runner that is gone; reclaiming")
+                self.board.reclaim(tid, "stale claim: its runner exited")
+                self.board.promote(tid)
+            if not self.board.claim(tid, self.claim_ttl()):
+                status = self.board.tasks().get(card.id, {}).get("status")
+                if status == "running":
+                    # Lost the race to a runner on another host (local runners are kept out by the card lock).
+                    handle.close()
+                    busy.append(card.id)
+                    continue
+                log(f"{card.id}: board claim refused (status {status}); running it anyway")
+            return card, task, handle, busy
+        return None, None, None, busy
 
     def run(self, once: bool = False, only: str | None = None) -> int:
         if self.git("branch", "--show-current") != self.config.branch:
@@ -570,7 +666,7 @@ class Driver:
                 return 0
             if self.config.pause_file.exists():
                 log(f"paused by {self.config.pause_file}; waiting")
-                time.sleep(30)
+                time.sleep(min(30, self.config.poll_s * 10))
                 continue
             dirty = self.dirty()
             if dirty:
@@ -578,17 +674,27 @@ class Driver:
             self.prepare()
             cards = load_cards(self.config.cards_path, self.config.card_pattern)
             tasks = self.sync_board(cards)
-            card, reason = self.next_card(cards, tasks, only)
-            if card is None:
+            runnable, reason = self.candidates(cards, tasks, only)
+            if not runnable:
                 log(reason)
                 return 0
-            if card.id not in tasks:
-                sys.exit(f"card {card.id} missing on board {self.config.board}")
+            card = None
             try:
-                with self.model_lock():
-                    ok = self.run_card(card, tasks[card.id])
+                with self.model_slot() as slot:
+                    if slot is None:
+                        continue
+                    # Another runner may have taken cards while this one waited for the slot.
+                    runnable, reason = self.candidates(cards, self.board.tasks(), only)
+                    card, task, handle, busy = self.claim_next(runnable, self.board.tasks())
+                    if card is not None:
+                        try:
+                            if len(self.base.model_slots()) > 1:
+                                log(f"{card.id}: on model slot {slot.lock} (DSH_HOME {slot.home})")
+                            ok = self.run_card(card, task)
+                        finally:
+                            handle.close()
             except Stopped:
-                log(f"{card.id}: stopped")
+                log(f"{card.id if card else 'runner'}: stopped")
                 return 0
             except Unreachable as exc:
                 log(str(exc))
@@ -596,6 +702,15 @@ class Driver:
             except BrokenSetup as exc:
                 log(f"{card.id}: {exc}; fix the setup (dsh-runner check) and rerun")
                 return 1
+            if card is None:
+                if not busy or once:
+                    log(reason or f"nothing to claim; other runners hold {busy}")
+                    return 0
+                log(f"other runners hold {busy}; waiting for them")
+                deadline = time.time() + min(60, self.config.poll_s * 20)
+                while time.time() < deadline and not self.stop_requested():
+                    time.sleep(min(3, self.config.poll_s))
+                continue
             if not ok:
                 log(f"{card.id} not completed; continuing with other ready cards")
             if once or only:
