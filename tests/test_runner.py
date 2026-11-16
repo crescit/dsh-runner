@@ -20,20 +20,22 @@ from dsh_runner.driver import Driver  # noqa: E402
 from dsh_runner.workers import ensure_worktree, worker_config  # noqa: E402
 
 FAKES = Path(__file__).resolve().parent / "fakes"
-CHECK = "import pathlib, sys\nsys.exit(0 if pathlib.Path('src/out.txt').read_text() == 'ok' else 1)\n"
+CHECK = ("import pathlib, sys\n"
+         "path = pathlib.Path(sys.argv[1])\n"
+         "sys.exit(0 if path.is_file() and path.read_text() == sys.argv[2] else 1)\n")
 
 
-def card(cid, title, depends=(), gate=False, allowed=("src/out.txt",)):
+def card(cid, title, depends=(), gate=False, allowed=("src/out.txt",), expected="ok"):
     return textwrap.dedent(f"""\
         ---
         id: {cid}
         title: {title}
         depends: [{", ".join(depends)}]
         allowed: [{", ".join(allowed)}]
-        accept: python3 tools/check.py
+        accept: python3 tools/check.py {allowed[0]} {expected}
         gate: {str(gate).lower()}
         ---
-        Write the word ok into src/out.txt.
+        Write {expected} into {allowed[0]}.
         """)
 
 
@@ -122,6 +124,22 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.git("log", "-1", "--format=%s"), "A01: Write ok")
         self.assertEqual(self.git("show", "--name-only", "--format=", "HEAD"), "src/out.txt")
 
+    def test_already_satisfied_card_is_completed_without_a_session_or_commit(self):
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "out.txt").write_text("ok")
+        self.commit_cards(A01=card("A01", "Already done"))
+        self.plan({"write": {"src/out.txt": "unnecessary edit"}})
+        head = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.run_driver(), 0)
+        self.assertEqual(self.board()["A01"]["status"], "done")
+        self.assertEqual(self.board()["A01"]["result"], "verified no-change")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertFalse(Path(os.environ["FAKE_DSH_PLAN"] + ".count").exists())
+        result = json.loads((self.repo / "runs/board/A01/preflight/result.json").read_text())
+        self.assertEqual(result["verification"], "no-change")
+        self.assertEqual((result["attempt"], result["tool_calls"], result["touched"]), (0, 0, []))
+
     def test_session_cut_off_at_the_token_limit_is_resumed_not_failed(self):
         # Found in a real run: a model read for a whole turn, hit max-tokens before writing, and lost the attempt.
         self.commit_cards(A01=card("A01", "Write ok"))
@@ -159,7 +177,7 @@ class RunnerTest(unittest.TestCase):
 
     def test_dependencies_run_in_order_and_gates_hold_only_themselves(self):
         self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Gate", depends=["A01"], gate=True),
-                          A03=card("A03", "Second", depends=["A01"], allowed=["src/out.txt", "src/second.txt"]))
+                          A03=card("A03", "Second", depends=["A01"], allowed=["src/second.txt"], expected="2"))
         self.plan({"write": {"src/out.txt": "ok"}}, {"write": {"src/second.txt": "2"}})
         self.assertEqual(self.run_driver(), 0)
         self.assertEqual(self.git("log", "--format=%s", "-2").splitlines(), ["A03: Second", "A01: First"])
@@ -253,15 +271,13 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(driver.config.dsh_home, driver.base.dsh_home)
 
     def test_a_card_another_live_runner_owns_is_skipped(self):
-        self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", allowed=["src/second.txt"]))
+        self.commit_cards(A01=card("A01", "First"),
+                          A02=card("A02", "Second", allowed=["src/second.txt"], expected="2"))
         driver = Driver(load(self.repo))
         driver.sync_board(load_cards(driver.config.cards_path, driver.config.card_pattern))
         driver.board.claim(self.board()["A01"]["id"], 60)
         self.hold(driver.config.claims_path / "A01.lock")
         self.plan({"write": {"src/second.txt": "2"}})
-        check2 = "import pathlib, sys\nsys.exit(0 if pathlib.Path('src/second.txt').exists() else 1)\n"
-        (self.repo / "tools" / "check.py").write_text(check2)
-        self.git("commit", "-qam", "check second")
         self.assertEqual(driver.run(once=True), 0)
         self.assertEqual(self.git("log", "-1", "--format=%s"), "A02: Second")
         self.assertEqual(self.board()["A01"]["status"], "running")
@@ -302,12 +318,9 @@ class RunnerTest(unittest.TestCase):
             setattr(driver, name, value)
         return driver
 
-    def lenient_check(self):
-        (self.repo / "tools" / "check.py").write_text("import pathlib, sys\nsys.exit(0)\n")
-        self.git("commit", "-qam", "lenient check")
-
     def test_workers_land_their_commits_on_the_main_branch(self):
-        self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", allowed=["src/second.txt"]))
+        self.commit_cards(A01=card("A01", "First"),
+                          A02=card("A02", "Second", allowed=["src/second.txt"], expected="2"))
         self.plan({"write": {"src/out.txt": "ok"}}, {"write": {"src/second.txt": "2"}})
         w1, w2 = self.worker(1), self.worker(2)
         self.assertEqual(w1.run(once=True), 0)
@@ -319,9 +332,8 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(self.board()["A02"]["result"].startswith("commit "))
 
     def test_a_merge_conflict_parks_the_work_and_blocks_only_that_card(self):
-        self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second"),
-                          A03=card("A03", "Third", depends=["A02"], allowed=["src/third.txt"]))
-        self.lenient_check()
+        self.commit_cards(A01=card("A01", "First", expected="one"), A02=card("A02", "Second", expected="two"),
+                          A03=card("A03", "Third", depends=["A02"], allowed=["src/third.txt"], expected="3"))
         self.plan({"write": {"src/out.txt": "one"}}, {"write": {"src/out.txt": "two"}},
                   {"write": {"src/third.txt": "3"}})
         w1 = self.worker(1)
@@ -377,7 +389,6 @@ class RunnerTest(unittest.TestCase):
         from dsh_runner import cli
         self.commit_cards(A01=card("A01", "First"), A02=card("A02", "Second", allowed=["src/second.txt"]))
         self.add_slots()
-        self.lenient_check()
         self.plan(*[{"write_allowed": "ok"}] * 4)  # sessions run concurrently, in either order
         with patch.dict(os.environ, PYTHONPATH=str(ROOT / "src")):
             self.assertEqual(cli.main(["-C", str(self.repo), "run", "--workers", "2"]), 0)
