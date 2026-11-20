@@ -316,7 +316,8 @@ class Driver:
     @staticmethod
     def patch_setting(text: str, name: str):
         """The `agent-default-model` entry in a patch file (repo or profile), with any indentation."""
-        return re.search(rf"id: agent-default-model\n(?:\s*.*\n)*?\s*{name}: (\S+)", text)
+        # Lines up to the next list entry (`- id: ...`) only, so another entry's keys never match.
+        return re.search(rf"id: agent-default-model\n(?:(?![ \t]*- ).*\n)*?[ \t]*{name}: (\S+)", text)
 
     def dsh_setting(self, name: str) -> str:
         """The default model or reasoning effort: the repository patch first, then the headless profile."""
