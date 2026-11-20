@@ -90,6 +90,9 @@ class Driver:
         self.config = config
         self.board = board or Board(config.board)
         self.held: set[str] = set()
+        # Cards this process already ran. One that comes up again means the board never recorded the outcome
+        # (Hermes refused the update); running it again would loop forever, so it is skipped until the next run.
+        self.attempted: set[str] = set()
         self.last_session_end = 0.0
         self.interrupted = False  # SIGINT/SIGTERM: stop like the STOP file, parking work and releasing the card
 
@@ -176,12 +179,47 @@ class Driver:
                 self.board.link(parent, tid)
             for parent in sorted(current - wanted):
                 self.board.unlink(parent, tid)
-            if cid not in done and tasks[cid].get("status") == "todo" and all(d in done for d in card.depends):
-                self.board.promote(tid)
-            if cid in done and tasks[cid].get("status") == "blocked":
-                # Its commit reached the branch while the task was blocked: a parked card merged by hand.
-                self.board.complete(tid, f"commit on {self.config.land_to or self.config.branch}", "merged by hand")
+        self.complete_landed(cards, tasks, done)
+        tasks = self.board.tasks()
+        for cid, card in cards.items():
+            if cid in tasks and cid not in done and tasks[cid].get("status") == "todo" \
+                    and all(d in done for d in card.depends):
+                self.board.promote(tasks[cid]["id"])
         return self.board.tasks()
+
+    @staticmethod
+    def dependency_order(cards: dict[str, Card]) -> list[str]:
+        """Card ids with every dependency before its dependents (unknown or cyclic links are ignored)."""
+        order, seen = [], set()
+
+        def visit(cid: str, path: frozenset) -> None:
+            if cid in seen or cid in path or cid not in cards:
+                return
+            for dep in cards[cid].depends:
+                visit(dep, path | {cid})
+            seen.add(cid)
+            order.append(cid)
+
+        for cid in sorted(cards):
+            visit(cid, frozenset())
+        return order
+
+    def complete_landed(self, cards: dict[str, Card], tasks: dict, done: set[str]) -> None:
+        """Mark done every task whose card is done by commit but whose board status is not.
+
+        A card landed by hand, or committed while its task sat in todo, otherwise stays open on the board, and Hermes
+        refuses to promote, claim or complete its dependents (unsatisfied parents). Parents go first for that reason.
+        A running task is left alone: a live runner owns it and completes it itself.
+        """
+        branch = self.config.land_to or self.config.branch
+        for cid in self.dependency_order(cards):
+            task = tasks.get(cid)
+            if cid not in done or task is None or task.get("status") in ("done", "archived", "running"):
+                continue
+            if self.board.complete(task["id"], f"commit on {branch}", "landed: its commit is on the branch"):
+                log(f"{cid}: marked done on the board (commit on {branch})")
+            else:
+                log(f"{cid}: board refused completion: {self.board.last_error}")
 
     # --- pacing and stop controls -----------------------------------------------------------------------------
 
@@ -492,8 +530,13 @@ class Driver:
                 "tool_calls": 0, "output_tokens": 0, "acceptance": "PASS", "touched": [],
                 "verification": "no-change", "accept_tail": preflight_tail, "at": now(),
             }, indent=2))
-            self.board.complete(tid, "verified no-change", f"{card.id} already satisfies acceptance; " +
-                                json.dumps(summary))
+            if not self.board.complete(tid, "verified no-change", f"{card.id} already satisfies acceptance; " +
+                                       json.dumps(summary)):
+                problem = self.board.last_error
+                log(f"{card.id}: already satisfies acceptance, but the board refused completion: {problem}")
+                self.board.comment(tid, f"runner: {card.id} already passes acceptance with no changes, but the "
+                                        f"board refused to complete it ({problem}). Complete it by hand.")
+                return False
             return True
         if preflight_changes:
             # Acceptance commands may generate files. They cannot count as evidence that
@@ -598,7 +641,9 @@ class Driver:
                         return False
                     sha = landed
                 summary = {k: stats[k] for k in ("minutes", "tool_calls", "output_tokens", "acceptance", "touched")}
-                self.board.complete(tid, f"commit {sha}", f"{card.id} committed {sha}: " + json.dumps(summary))
+                if not self.board.complete(tid, f"commit {sha}", f"{card.id} committed {sha}: " + json.dumps(summary)):
+                    # The commit is what counts (done_ids); the next sync retries the board update.
+                    log(f"{card.id}: committed {sha}, but the board refused completion: {self.board.last_error}")
                 return True
             problems = []
             if outside:
@@ -754,6 +799,8 @@ class Driver:
         """Claim the first card no other runner owns: (card, task, lock handle, cards busy elsewhere)."""
         busy = []
         for card in runnable:
+            if card.id in self.attempted:
+                continue
             task = tasks.get(card.id)
             if task is None:
                 sys.exit(f"card {card.id} missing on board {self.config.board}")
@@ -839,6 +886,7 @@ class Driver:
                         try:
                             if len(self.base.model_slots()) > 1:
                                 log(f"{card.id}: on model slot {slot.lock} (DSH_HOME {slot.home})")
+                            self.attempted.add(card.id)
                             ok = self.run_card(card, task)
                         finally:
                             handle.close()
@@ -853,7 +901,12 @@ class Driver:
                 return 1
             if card is None:
                 if not busy or once:
-                    log(reason or f"nothing to claim; other runners hold {busy}")
+                    again = [c.id for c in runnable if c.id in self.attempted]
+                    if again:
+                        log(f"stopping: {again} already ran in this run but the board still shows them open "
+                            "(see the card comments); fix the board and rerun")
+                    else:
+                        log(reason or f"nothing to claim; other runners hold {busy}")
                     return 0
                 self.wait_for_others(busy)
                 continue

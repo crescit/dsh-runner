@@ -14,6 +14,7 @@ class Board:
     def __init__(self, slug: str, hermes: str | None = None):
         self.slug = slug
         self.hermes = hermes or os.environ.get("DSH_RUNNER_HERMES", "hermes")
+        self.last_error = ""  # stderr of the last refused state change, for logs and comments
 
     def run(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run([self.hermes, "kanban", "--board", self.slug, *args],
@@ -51,8 +52,14 @@ class Board:
     def unlink(self, parent: str, child: str) -> None:
         self.run("unlink", parent, child)
 
-    def promote(self, task_id: str) -> None:
-        self.run("promote", task_id)
+    def _changed(self, *args: str) -> bool:
+        """Run a state change; False (with last_error set) when Hermes refuses it, e.g. unsatisfied parents."""
+        out = self.run(*args)
+        self.last_error = "" if out.returncode == 0 else (out.stderr or out.stdout).strip()
+        return out.returncode == 0
+
+    def promote(self, task_id: str) -> bool:
+        return self._changed("promote", task_id)
 
     def claim(self, task_id: str, ttl_s: int) -> bool:
         """Hermes claims atomically (ready -> running) and fails when another claimer got there first."""
@@ -61,11 +68,11 @@ class Board:
     def comment(self, task_id: str, text: str) -> None:
         self.run("comment", task_id, text)
 
-    def complete(self, task_id: str, result: str, summary: str) -> None:
-        self.run("complete", task_id, "--result", result, "--summary", summary)
+    def complete(self, task_id: str, result: str, summary: str) -> bool:
+        return self._changed("complete", task_id, "--result", result, "--summary", summary)
 
-    def block(self, task_id: str, reason: str) -> None:
-        self.run("block", task_id, reason)
+    def block(self, task_id: str, reason: str) -> bool:
+        return self._changed("block", task_id, reason)
 
     def reclaim(self, task_id: str, reason: str) -> None:
         self.run("reclaim", task_id, "--reason", reason)

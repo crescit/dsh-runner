@@ -34,6 +34,12 @@ def main(argv):
     def flag(name, default=None):
         return rest[rest.index(name) + 1] if name in rest else default
 
+    def unsatisfied(tid):
+        # Like Hermes: promote, claim and complete all re-check that every parent is done.
+        bad = [p for p in tasks[tid]["parents"] if tasks[p]["status"] not in ("done", "archived")]
+        if bad:
+            sys.exit(f"cannot {args.command} {tid}: unsatisfied parent dependencies: {', '.join(bad)}")
+
     if args.command == "list":
         print(json.dumps([{k: t[k] for k in ("id", "title", "status", "assignee", "result")} for t in tasks.values()]))
     elif args.command == "create":
@@ -59,16 +65,25 @@ def main(argv):
         elif args.command == "unlink" and parent in parents:
             parents.remove(parent)
     elif args.command == "promote":
+        unsatisfied(rest[0])
         tasks[rest[0]]["status"] = "ready"
     elif args.command == "claim":
         # Like Hermes: an atomic ready -> running swap that fails for anything else.
+        unsatisfied(rest[0])
         if tasks[rest[0]]["status"] != "ready":
             sys.exit(f"cannot claim {rest[0]}: status={tasks[rest[0]]['status']}")
         tasks[rest[0]]["status"] = "running"
     elif args.command == "comment":
         tasks[rest[0]]["comments"].append(rest[1])
     elif args.command == "complete":
+        if os.environ.get("FAKE_HERMES_REFUSE_COMPLETE"):
+            sys.exit(f"cannot complete {rest[0]}: refused (FAKE_HERMES_REFUSE_COMPLETE)")
+        unsatisfied(rest[0])
         tasks[rest[0]].update(status="done", result=flag("--result"))
+        for child in tasks.values():  # Hermes promotes children whose parents are now all done
+            if rest[0] in child["parents"] and child["status"] == "todo" and \
+                    all(tasks[p]["status"] in ("done", "archived") for p in child["parents"]):
+                child["status"] = "ready"
     elif args.command == "block":
         tasks[rest[0]]["status"] = "blocked"
     elif args.command == "reclaim":

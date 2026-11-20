@@ -109,7 +109,7 @@ Implement `load_settings(path)` in src/app/settings.py. ...
 | Field | Meaning |
 |---|---|
 | `id` | Letters then digits, with an optional letter suffix (`A02`, `O13b`). Board titles and commit subjects are `<id>: <title>`. |
-| `depends` | Card ids that must be done first. A card counts as done when its task is done or a commit with its exact subject is on the branch. |
+| `depends` | Card ids that must be done first. A card counts as done when its task is done or a commit with its exact subject is on the branch; every sync then marks such a task done on the board too, parents first, because Hermes will not promote, claim or complete a task whose parents are open. |
 | `allowed` | The only files the model may change. Everything else is reverted before acceptance runs. |
 | `accept` | A shell command, run from the repository root by the runner. Exit status 0 means done, including when the
   card needs no edits and the clean checkout already passes. |
@@ -224,6 +224,9 @@ the card on the board and runs its dependents.
 - A task left `running` by a runner that died is reclaimed and resumed from its carried work.
 - A card waits until its dependencies' runner commits are on its branch, and a runner waits, rather than exits,
   while other runners are working on cards that could unblock it.
+- A card runs at most once per `dsh-runner run`. If it comes up again because the board refused to record the
+  outcome (the refusal is logged and commented on the card), the runner stops instead of looping; fix the board
+  and rerun.
 - Ctrl-C (or SIGTERM) stops like STOP: partial edits are carried, the card is released. A second Ctrl-C kills.
 - Every runner sharing a board or slots must be on this version: an older one takes no card locks.
 
