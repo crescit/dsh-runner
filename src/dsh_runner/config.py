@@ -33,6 +33,7 @@ class Config:
     env: dict[str, str] = field(default_factory=dict)
     dsh_home: Path = Path.home() / ".dsh"
     dsh_bin: str = ""
+    dsh_patch: Path | None = None
     run_timeout_min: int = 30
     accept_timeout_min: int = 15
     min_nudge_s: int = 180
@@ -97,7 +98,7 @@ class Config:
 SECTIONS = {
     "runner": ("board", "branch", "planner_branch", "assignee", "cards_dir", "card_pattern", "log_dir",
                "setup", "ignored", "worker_rules", "env", "workers"),
-    "dsh": ("home", "bin"),
+    "dsh": ("home", "bin", "patch"),
     "limits": ("run_timeout_min", "accept_timeout_min", "min_nudge_s", "attempts", "infra_retries",
                "infra_backoff_s", "cooldown_s", "poll_s", "pause_file", "model_lock"),
 }
@@ -135,6 +136,15 @@ def load(repo: Path, path: Path | None = None) -> Config:
     if home:
         config.dsh_home = _path(home)
     config.dsh_bin = dsh.get("bin", "")
+    patch = dsh.get("patch")
+    if patch:
+        patch_path = _path(patch)
+        if not patch_path.is_absolute():
+            patch_path = config.repo / patch_path
+        patch_path = patch_path.resolve()
+        if not patch_path.is_file():
+            raise SystemExit(f"{path}: [dsh] patch file does not exist: {patch_path}")
+        config.dsh_patch = patch_path
     for slot in slots:
         if not slot.get("lock"):
             raise SystemExit(f"{path}: every [[slots]] entry needs a lock")

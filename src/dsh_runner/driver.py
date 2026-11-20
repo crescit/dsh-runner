@@ -313,11 +313,24 @@ class Driver:
                     env[key.strip()] = shlex.split(value)[0] if value.strip() else ""
         return env
 
+    @staticmethod
+    def patch_setting(text: str, name: str):
+        """The `agent-default-model` entry in a patch file (repo or profile), with any indentation."""
+        return re.search(rf"id: agent-default-model\n(?:\s*.*\n)*?\s*{name}: (\S+)", text)
+
     def dsh_setting(self, name: str) -> str:
-        """The headless profile's default model or reasoning effort, for commit messages and comments."""
+        """The default model or reasoning effort: the repository patch first, then the headless profile."""
+        if self.config.dsh_patch is not None:
+            try:
+                patch_text = self.config.dsh_patch.read_text()
+            except OSError:
+                patch_text = ""
+            match = self.patch_setting(patch_text, name)
+            if match:
+                return match.group(1)
         patch = self.config.dsh_home / "profiles" / "headless" / "cordis.patch.yml"
         text = patch.read_text() if patch.is_file() else ""
-        match = re.search(rf"id: agent-default-model\n(?:  .*\n)*?    {name}: (\S+)", text)
+        match = self.patch_setting(text, name)
         return match.group(1) if match else "default"
 
     @staticmethod
@@ -343,7 +356,12 @@ class Driver:
             return dict(exit="stopped", minutes=0.0, seconds=0.0, tool_calls=0, output_tokens=0, final="",
                         session=session_id)
         start = time.monotonic()
-        command = [self.config.dsh_command(), "headless", "--json", *(["--session-id", session_id] if session_id else []), "-"]
+        if self.config.dsh_patch is not None:
+            command = [self.config.dsh_command(), "--profile", "headless", "--patch", str(self.config.dsh_patch),
+                       "--json", *(["--session-id", session_id] if session_id else []), "-"]
+        else:
+            command = [self.config.dsh_command(), "headless", "--json",
+                       *(["--session-id", session_id] if session_id else []), "-"]
         with events_path.open("wb") as out, (logdir / f"stderr{tag}.txt").open("wb") as err:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=self.config.repo,
                                        env=self.dsh_env(), start_new_session=True)

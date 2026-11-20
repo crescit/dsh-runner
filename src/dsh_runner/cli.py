@@ -77,7 +77,10 @@ def check(driver: Driver) -> int:
             problems.append(f"dsh does not launch: {exc}")
     if not shutil.which(driver.board.hermes):
         problems.append("hermes not found: install Hermes Agent or set DSH_RUNNER_HERMES")
-    print(f"model    {driver.dsh_setting('model')} (headless profile default)")
+    if config.dsh_patch is not None:
+        print(f"model    {driver.dsh_setting('model')} (patch {config.dsh_patch})")
+    else:
+        print(f"model    {driver.dsh_setting('model')} (headless profile default)")
     for slot in config.model_slots():
         print(f"slot     {slot.lock} -> DSH_HOME {slot.home}")
         if not slot.home.is_dir():

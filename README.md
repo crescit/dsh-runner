@@ -252,6 +252,7 @@ env = { UV_CACHE_DIR = "./.uvcache" }        # values starting with ./ are resol
 [dsh]
 home = "~/.dsh"                 # DSH_HOME (default: $DSH_HOME or ~/.dsh)
 bin = ""                        # default: $DSH_HOME/runtime/node_modules/.bin/dsh, then `dsh` on PATH
+patch = "docs/model.patch.yml"  # repository patch passed to `dsh --profile headless --patch`; relative paths resolve against the repo root, `~` and $VARS expand; its agent-default-model overrides the headless profile's default
 
 [limits]
 run_timeout_min = 30            # hard cap per attempt, nudges included

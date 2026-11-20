@@ -14,6 +14,7 @@ log_dir = "runs/board"         # add to .gitignore
 
 [dsh]
 # home = "~/.dsh"
+# patch = "docs/model.patch.yml"   # repository patch passed to `dsh --profile headless --patch`; relative paths resolve against the repo root, `~` and $VARS expand
 
 [limits]
 run_timeout_min = 30
