@@ -24,6 +24,7 @@ plan = json.loads(Path(os.environ["FAKE_DSH_PLAN"]).read_text())
 counter = Path(os.environ["FAKE_DSH_PLAN"] + ".count")
 index = int(counter.read_text()) if counter.exists() else 0
 counter.write_text(str(index + 1))
+Path(os.environ["FAKE_DSH_PLAN"] + f".argv{index}").write_text(json.dumps(sys.argv[1:]))
 prompt = sys.stdin.read()
 Path(os.environ["FAKE_DSH_PLAN"] + f".prompt{index}").write_text(prompt)
 Path(os.environ["FAKE_DSH_PLAN"] + f".home{index}").write_text(os.environ.get("DSH_HOME", ""))
